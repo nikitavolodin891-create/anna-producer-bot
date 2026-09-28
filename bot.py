@@ -139,10 +139,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(reply_text)
 
 
+TELEGRAM_BOT_FILE_LIMIT = 20 * 1024 * 1024  # 20 МБ — жёсткий лимит Telegram Bot API на скачивание файлов
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Голосовые/аудио-сообщения бот слышать не умеет — честно предупреждаем вместо молчания."""
+    await update.message.reply_text(
+        "Я пока не умею слушать голосовые сообщения — Anthropic API не принимает аудио "
+        "напрямую. Напиши, пожалуйста, то же самое текстом — так я точно всё пойму."
+    )
+
+
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Принимает видео (как видео-сообщение или как документ) и загружает на Cloudinary."""
     video = update.message.video or update.message.document
     if video is None:
+        return
+
+    # Telegram Bot API физически не даёт скачать файл тяжелее 20 МБ — проверяем заранее,
+    # чтобы не тратить время и не пугать техническим текстом ошибки.
+    file_size = getattr(video, "file_size", None)
+    if file_size and file_size > TELEGRAM_BOT_FILE_LIMIT:
+        size_mb = file_size / (1024 * 1024)
+        await update.message.reply_text(
+            f"Файл весит {size_mb:.1f} МБ — это больше 20 МБ, а это жёсткий лимит Telegram "
+            "на скачивание файлов ботами (не наше ограничение, платформенное).\n\n"
+            "Что делать:\n"
+            "— сожми видео (например, через приложение для сжатия видео) и пришли заново, или\n"
+            "— залей на Google Drive/Dropbox с доступом «по ссылке» и пришли мне ссылку текстом."
+        )
         return
 
     await update.message.reply_text("Загружаю видео, подожди немного...")
@@ -169,16 +194,24 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
     except Exception as e:
         logger.exception("Video upload error")
-        await update.message.reply_text(
-            f"Не получилось загрузить видео: {e}\n"
-            "Попробуй ещё раз или залей вручную на Google Drive и пришли ссылку."
-        )
+        error_text = str(e)
+        if "too big" in error_text.lower() or "file is too big" in error_text.lower():
+            await update.message.reply_text(
+                "Файл слишком большой — Telegram не даёт ботам скачивать файлы тяжелее 20 МБ.\n\n"
+                "Сожми видео или залей на Google Drive/Dropbox и пришли ссылку текстом."
+            )
+        else:
+            await update.message.reply_text(
+                f"Не получилось загрузить видео: {e}\n"
+                "Попробуй ещё раз или залей вручную на Google Drive и пришли ссылку."
+            )
 
 
 def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("Bot started")
     app.run_polling()
