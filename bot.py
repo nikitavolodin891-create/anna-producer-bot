@@ -502,15 +502,12 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         error_text = str(e)
         if "too big" in error_text.lower() or "file is too big" in error_text.lower():
             await update.message.reply_text(
-                "Файл слишком большой для скачивания ботом.
-
-"
+                "Файл слишком большой для скачивания ботом.\n\n"
                 "Сожми видео или залей на Google Drive/Dropbox и пришли ссылку текстом."
             )
         else:
             await update.message.reply_text(
-                f"Не получилось загрузить видео: {e}
-"
+                f"Не получилось загрузить видео: {e}\n"
                 "Попробуй ещё раз или залей вручную на Google Drive и пришли ссылку."
             )
 
@@ -577,8 +574,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except Exception as e:
         logger.exception("Photo analysis error")
         await update.message.reply_text(
-            f"Не получилось разобрать фото: {e}
-Попробуй ещё раз."
+            f"Не получилось разобрать фото: {e}\nПопробуй ещё раз."
         )
 
 
@@ -597,8 +593,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if not is_pdf and not is_image:
         await update.message.reply_text(
-            f"Пока не умею читать файлы такого типа ({mime or 'неизвестный формат'}).
-"
+            f"Пока не умею читать файлы такого типа ({mime or 'неизвестный формат'}).\n"
             "Поддерживаю: PDF и изображения (файлом или как фото). Видео — тоже ок, грузится отдельно."
         )
         return
@@ -670,8 +665,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception as e:
         logger.exception("Document analysis error")
         await update.message.reply_text(
-            f"Не получилось разобрать файл: {e}
-Попробуй ещё раз."
+            f"Не получилось разобрать файл: {e}\nПопробуй ещё раз."
         )
 
 
