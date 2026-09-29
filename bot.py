@@ -407,7 +407,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(reply_text)
 
 
-TELEGRAM_BOT_FILE_LIMIT = 20 * 1024 * 1024  # 20 МБ — жёсткий лимит Telegram Bot API на скачивание файлов
+TELEGRAM_BOT_FILE_LIMIT = 2000 * 1024 * 1024  # 2000 МБ — лимит собственного (self-hosted) Telegram Bot API сервера
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -464,17 +464,14 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if video is None:
         return
 
-    # Telegram Bot API физически не даёт скачать файл тяжелее 20 МБ — проверяем заранее,
-    # чтобы не тратить время и не пугать техническим текстом ошибки.
+    # Проверяем размер заранее, чтобы не тратить время и не пугать техническим текстом ошибки.
     file_size = getattr(video, "file_size", None)
     if file_size and file_size > TELEGRAM_BOT_FILE_LIMIT:
         size_mb = file_size / (1024 * 1024)
         await update.message.reply_text(
-            f"Файл весит {size_mb:.1f} МБ — это больше 20 МБ, а это жёсткий лимит Telegram "
-            "на скачивание файлов ботами (не наше ограничение, платформенное).\n\n"
-            "Что делать:\n"
-            "— сожми видео (например, через приложение для сжатия видео) и пришли заново, или\n"
-            "— залей на Google Drive/Dropbox с доступом «по ссылке» и пришли мне ссылку текстом."
+            f"Файл весит {size_mb:.1f} МБ — это больше {TELEGRAM_BOT_FILE_LIMIT / 1024 / 1024:.0f} МБ, "
+            "текущего лимита на скачивание файлов ботом.\n\n"
+            "Залей на Google Drive/Dropbox с доступом «по ссылке» и пришли мне ссылку текстом."
         )
         return
 
@@ -505,12 +502,15 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         error_text = str(e)
         if "too big" in error_text.lower() or "file is too big" in error_text.lower():
             await update.message.reply_text(
-                "Файл слишком большой — Telegram не даёт ботам скачивать файлы тяжелее 20 МБ.\n\n"
+                "Файл слишком большой для скачивания ботом.
+
+"
                 "Сожми видео или залей на Google Drive/Dropbox и пришли ссылку текстом."
             )
         else:
             await update.message.reply_text(
-                f"Не получилось загрузить видео: {e}\n"
+                f"Не получилось загрузить видео: {e}
+"
                 "Попробуй ещё раз или залей вручную на Google Drive и пришли ссылку."
             )
 
@@ -577,7 +577,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except Exception as e:
         logger.exception("Photo analysis error")
         await update.message.reply_text(
-            f"Не получилось разобрать фото: {e}\nПопробуй ещё раз."
+            f"Не получилось разобрать фото: {e}
+Попробуй ещё раз."
         )
 
 
@@ -596,7 +597,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if not is_pdf and not is_image:
         await update.message.reply_text(
-            f"Пока не умею читать файлы такого типа ({mime or 'неизвестный формат'}).\n"
+            f"Пока не умею читать файлы такого типа ({mime or 'неизвестный формат'}).
+"
             "Поддерживаю: PDF и изображения (файлом или как фото). Видео — тоже ок, грузится отдельно."
         )
         return
@@ -605,8 +607,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if file_size and file_size > TELEGRAM_BOT_FILE_LIMIT:
         size_mb = file_size / (1024 * 1024)
         await update.message.reply_text(
-            f"Файл весит {size_mb:.1f} МБ — это больше 20 МБ, а это жёсткий лимит Telegram "
-            "на скачивание файлов ботами."
+            f"Файл весит {size_mb:.1f} МБ — это больше {TELEGRAM_BOT_FILE_LIMIT / 1024 / 1024:.0f} МБ, "
+            "текущего лимита на скачивание файлов ботом."
         )
         return
 
@@ -668,12 +670,27 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception as e:
         logger.exception("Document analysis error")
         await update.message.reply_text(
-            f"Не получилось разобрать файл: {e}\nПопробуй ещё раз."
+            f"Не получилось разобрать файл: {e}
+Попробуй ещё раз."
         )
 
 
 def main() -> None:
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    # Свой (self-hosted) Telegram Bot API сервер — снимает стандартный лимит Telegram
+    # в 20 МБ на скачивание файлов ботом (там теперь до 2 ГБ). Работает во внутренней
+    # сети Railway (тот же проект), поэтому обращаемся по приватному адресу.
+    local_api_url = os.environ.get("LOCAL_BOT_API_URL", "http://telegram-bot-api.railway.internal:8080")
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .base_url(f"{local_api_url}/bot")
+        .base_file_url(f"{local_api_url}/file/bot")
+        .connect_timeout(60)
+        .read_timeout(120)
+        .write_timeout(120)
+        .pool_timeout(60)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
