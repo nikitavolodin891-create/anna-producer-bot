@@ -1,9 +1,12 @@
 import os
 import io
+import re
 import json
 import base64
 import logging
 
+import httpx
+from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import anthropic
@@ -293,10 +296,115 @@ async def ask_claude_and_reply(update: Update, chat_id: int, user_text: str) -> 
     await update.message.reply_text(reply_text)
 
 
+URL_RE = re.compile(r'https?://[^\s<>"\']+')
+MAX_FETCH_BYTES = 8 * 1024 * 1024  # 8 МБ — разумный лимит на скачивание содержимого по ссылке
+MAX_LINKS_PER_MESSAGE = 2  # не открываем больше пары ссылок за раз, чтобы не перегружать модель
+
+
+async def fetch_url_content(url: str) -> dict:
+    """Скачивает содержимое по ссылке и определяет, как его отдать Клоду."""
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=15.0,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; AnnaProducerBot/1.0)"},
+        ) as http_client:
+            resp = await http_client.get(url)
+            resp.raise_for_status()
+
+            content_length = int(resp.headers.get("content-length") or 0)
+            if content_length and content_length > MAX_FETCH_BYTES:
+                return {"kind": "error", "message": f"файл слишком большой ({content_length / 1024 / 1024:.1f} МБ)"}
+
+            data = resp.content
+            if len(data) > MAX_FETCH_BYTES:
+                return {"kind": "error", "message": "файл слишком большой"}
+
+            content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
+
+            if content_type.startswith("image/"):
+                return {"kind": "image", "data": data, "mime": content_type}
+            if content_type == "application/pdf":
+                return {"kind": "pdf", "data": data}
+            if "text/html" in content_type or content_type == "":
+                soup = BeautifulSoup(data, "html.parser")
+                for tag in soup(["script", "style", "noscript"]):
+                    tag.decompose()
+                text = soup.get_text(separator="\n")
+                text = re.sub(r'\n\s*\n+', '\n\n', text).strip()
+                if not text:
+                    return {"kind": "error", "message": "страница пустая или не отдаёт текст без JS"}
+                return {"kind": "text", "content": text[:8000]}
+            return {"kind": "error", "message": f"не умею обрабатывать содержимое типа {content_type or 'неизвестно'}"}
+
+    except httpx.HTTPStatusError as e:
+        return {"kind": "error", "message": f"сайт ответил ошибкой {e.response.status_code}"}
+    except Exception as e:
+        return {"kind": "error", "message": f"не получилось открыть ссылку: {e}"}
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     user_text = update.message.text
-    await ask_claude_and_reply(update, chat_id, user_text)
+    urls = URL_RE.findall(user_text)[:MAX_LINKS_PER_MESSAGE]
+
+    if not urls:
+        await ask_claude_and_reply(update, chat_id, user_text)
+        return
+
+    await update.message.reply_text("Открываю ссылку, подожди немного...")
+    await update.message.chat.send_action("typing")
+
+    history = conversations.setdefault(chat_id, [])
+    content_blocks = []
+    notes = []
+
+    for url in urls:
+        result = await fetch_url_content(url)
+        if result["kind"] == "text":
+            content_blocks.append({"type": "text", "text": f"[Содержимое страницы {url}]:\n{result['content']}"})
+            notes.append(f"[Ссылка: {url}]")
+        elif result["kind"] == "image":
+            content_blocks.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": result["mime"], "data": base64.b64encode(result["data"]).decode("utf-8")},
+            })
+            notes.append(f"[Изображение по ссылке: {url}]")
+        elif result["kind"] == "pdf":
+            content_blocks.append({
+                "type": "document",
+                "source": {"type": "base64", "media_type": "application/pdf", "data": base64.b64encode(result["data"]).decode("utf-8")},
+            })
+            notes.append(f"[PDF по ссылке: {url}]")
+        else:
+            await update.message.reply_text(f"{url} — {result['message']}")
+            notes.append(f"[Не удалось открыть ссылку {url}: {result['message']}]")
+
+    content_blocks.append({"type": "text", "text": user_text})
+
+    history.append({"role": "user", "content": content_blocks})
+    history_for_model = history[-MAX_HISTORY_MESSAGES:]
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2000,
+            system=SYSTEM_PROMPT,
+            messages=history_for_model,
+        )
+        reply_text = "".join(
+            block.text for block in response.content if block.type == "text"
+        )
+    except Exception as e:
+        logger.exception("Anthropic API error (link)")
+        reply_text = f"Произошла ошибка при обращении к агенту: {e}"
+
+    history[-1] = {"role": "user", "content": " ".join(notes + [user_text])}
+    history.append({"role": "assistant", "content": reply_text})
+    conversations[chat_id] = history[-MAX_HISTORY_MESSAGES:]
+    _save_conversations()
+
+    await update.message.reply_text(reply_text)
 
 
 TELEGRAM_BOT_FILE_LIMIT = 20 * 1024 * 1024  # 20 МБ — жёсткий лимит Telegram Bot API на скачивание файлов
@@ -473,12 +581,104 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
 
 
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Файлы-документы: PDF и изображения, отправленные как файл (не сжатые фото)."""
+    doc = update.message.document
+    if doc is None:
+        return
+
+    mime = (doc.mime_type or "").lower()
+    file_name = doc.file_name or ""
+    caption = (update.message.caption or "").strip()
+
+    is_pdf = mime == "application/pdf" or file_name.lower().endswith(".pdf")
+    is_image = mime.startswith("image/")
+
+    if not is_pdf and not is_image:
+        await update.message.reply_text(
+            f"Пока не умею читать файлы такого типа ({mime or 'неизвестный формат'}).\n"
+            "Поддерживаю: PDF и изображения (файлом или как фото). Видео — тоже ок, грузится отдельно."
+        )
+        return
+
+    file_size = getattr(doc, "file_size", None)
+    if file_size and file_size > TELEGRAM_BOT_FILE_LIMIT:
+        size_mb = file_size / (1024 * 1024)
+        await update.message.reply_text(
+            f"Файл весит {size_mb:.1f} МБ — это больше 20 МБ, а это жёсткий лимит Telegram "
+            "на скачивание файлов ботами."
+        )
+        return
+
+    await update.message.chat.send_action("typing")
+
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        buf = io.BytesIO()
+        await tg_file.download_to_memory(out=buf)
+        file_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        chat_id = update.effective_chat.id
+        history = conversations.setdefault(chat_id, [])
+
+        if is_pdf:
+            content_block = {
+                "type": "document",
+                "source": {"type": "base64", "media_type": "application/pdf", "data": file_b64},
+            }
+            default_prompt = "Посмотри этот PDF и разбери содержимое по существу."
+            note_label = f"[PDF: {file_name}]"
+        else:
+            content_block = {
+                "type": "image",
+                "source": {"type": "base64", "media_type": mime, "data": file_b64},
+            }
+            default_prompt = (
+                "Посмотри на это изображение и прокомментируй его содержательно — как продюсер, "
+                "если это релевантно контенту Анны, или просто по существу, если это что-то другое."
+            )
+            note_label = f"[Изображение-файл: {file_name}]"
+
+        vision_prompt = caption if caption else default_prompt
+
+        history.append({
+            "role": "user",
+            "content": [content_block, {"type": "text", "text": vision_prompt}],
+        })
+        history_for_model = history[-MAX_HISTORY_MESSAGES:]
+
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2000,
+            system=SYSTEM_PROMPT,
+            messages=history_for_model,
+        )
+        reply_text = "".join(
+            block.text for block in response.content if block.type == "text"
+        )
+
+        user_note = f"{note_label} {caption}" if caption else note_label
+        history[-1] = {"role": "user", "content": user_note}
+        history.append({"role": "assistant", "content": reply_text})
+        conversations[chat_id] = history[-MAX_HISTORY_MESSAGES:]
+        _save_conversations()
+
+        await update.message.reply_text(reply_text)
+
+    except Exception as e:
+        logger.exception("Document analysis error")
+        await update.message.reply_text(
+            f"Не получилось разобрать файл: {e}\nПопробуй ещё раз."
+        )
+
+
 def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL & ~filters.Document.VIDEO, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("Bot started")
     app.run_polling()
