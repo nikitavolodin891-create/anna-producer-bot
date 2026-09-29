@@ -410,6 +410,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 TELEGRAM_BOT_FILE_LIMIT = 2000 * 1024 * 1024  # 2000 МБ — лимит собственного (self-hosted) Telegram Bot API сервера
 
 
+async def download_telegram_file(tg_file) -> bytes:
+    """Скачивает файл Telegram.
+
+    Наш self-hosted Bot API сервер запущен в режиме --local: в этом режиме Telegram
+    отдаёт в file_path не относительный путь для скачивания по HTTP, а АБСОЛЮТНЫЙ путь
+    файла на диске сервера (см. официальную документацию tdlib/telegram-bot-api).
+    Сервер telegram-bot-api и бот работают в одном контейнере с общей файловой
+    системой, поэтому в этом случае просто читаем файл напрямую с диска — так и
+    задумано в local-режиме. Если же путь не абсолютный (обычный режим без --local),
+    скачиваем как раньше — через HTTP.
+    """
+    file_path = tg_file.file_path
+    if file_path and os.path.isabs(file_path) and os.path.exists(file_path):
+        with open(file_path, "rb") as f:
+            return f.read()
+    buf = io.BytesIO()
+    await tg_file.download_to_memory(out=buf)
+    return buf.getvalue()
+
+
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Голосовые/аудио-сообщения: скачиваем, распознаём через Whisper, отвечаем как на текст."""
     if openai_client is None:
@@ -428,8 +448,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     try:
         tg_file = await context.bot.get_file(voice.file_id)
-        buf = io.BytesIO()
-        await tg_file.download_to_memory(out=buf)
+        data = await download_telegram_file(tg_file)
+        buf = io.BytesIO(data)
         buf.seek(0)
         buf.name = "voice.ogg"  # Whisper API определяет формат по расширению имени файла
 
@@ -480,8 +500,8 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     try:
         tg_file = await context.bot.get_file(video.file_id)
-        buf = io.BytesIO()
-        await tg_file.download_to_memory(out=buf)
+        data = await download_telegram_file(tg_file)
+        buf = io.BytesIO(data)
         buf.seek(0)
 
         upload_result = cloudinary.uploader.upload_large(
@@ -524,9 +544,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     try:
         tg_file = await context.bot.get_file(photo.file_id)
-        buf = io.BytesIO()
-        await tg_file.download_to_memory(out=buf)
-        image_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        data = await download_telegram_file(tg_file)
+        image_b64 = base64.b64encode(data).decode("utf-8")
 
         chat_id = update.effective_chat.id
         history = conversations.setdefault(chat_id, [])
@@ -611,9 +630,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     try:
         tg_file = await context.bot.get_file(doc.file_id)
-        buf = io.BytesIO()
-        await tg_file.download_to_memory(out=buf)
-        file_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        data = await download_telegram_file(tg_file)
+        file_b64 = base64.b64encode(data).decode("utf-8")
 
         chat_id = update.effective_chat.id
         history = conversations.setdefault(chat_id, [])
@@ -671,9 +689,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 def main() -> None:
     # Свой (self-hosted) Telegram Bot API сервер — снимает стандартный лимит Telegram
-    # в 20 МБ на скачивание файлов ботом (там теперь до 2 ГБ). Работает во внутренней
-    # сети Railway (тот же проект), поэтому обращаемся по приватному адресу.
-    local_api_url = os.environ.get("LOCAL_BOT_API_URL", "http://telegram-bot-api.railway.internal:8080")
+    # в 20 МБ на скачивание файлов ботом (там теперь безлимитно на download, до 2 ГБ на
+    # upload). Сервер telegram-bot-api и этот процесс запускаются в ОДНОМ контейнере
+    # (см. start.sh) и делят общий диск — это обязательно для режима --local, в котором
+    # getFile отдаёт абсолютный локальный путь вместо ссылки для HTTP-скачивания
+    # (см. download_telegram_file выше).
+    local_api_url = os.environ.get("LOCAL_BOT_API_URL", "http://localhost:8081")
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
