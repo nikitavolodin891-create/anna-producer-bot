@@ -1,6 +1,7 @@
 import os
 import io
 import json
+import base64
 import logging
 
 from telegram import Update
@@ -406,11 +407,78 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
 
 
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Фото: скачиваем, отправляем в Claude как изображение (у Claude есть зрение), отвечаем."""
+    photo = update.message.photo[-1] if update.message.photo else None
+    if photo is None:
+        return
+
+    caption = (update.message.caption or "").strip()
+
+    await update.message.chat.send_action("typing")
+
+    try:
+        tg_file = await context.bot.get_file(photo.file_id)
+        buf = io.BytesIO()
+        await tg_file.download_to_memory(out=buf)
+        image_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        chat_id = update.effective_chat.id
+        history = conversations.setdefault(chat_id, [])
+
+        vision_prompt = caption if caption else (
+            "Посмотри на это фото и прокомментируй его содержательно — как продюсер, "
+            "если это релевантно контенту Анны, или просто по существу, если это что-то другое."
+        )
+
+        history.append({
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": image_b64,
+                    },
+                },
+                {"type": "text", "text": vision_prompt},
+            ],
+        })
+        history_for_model = history[-MAX_HISTORY_MESSAGES:]
+
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2000,
+            system=SYSTEM_PROMPT,
+            messages=history_for_model,
+        )
+        reply_text = "".join(
+            block.text for block in response.content if block.type == "text"
+        )
+
+        # В истории саму картинку текстом не храним (не нужно раздувать файл) — оставляем заметку.
+        user_note = f"[Фото] {caption}" if caption else "[Фото без подписи]"
+        history[-1] = {"role": "user", "content": user_note}
+        history.append({"role": "assistant", "content": reply_text})
+        conversations[chat_id] = history[-MAX_HISTORY_MESSAGES:]
+        _save_conversations()
+
+        await update.message.reply_text(reply_text)
+
+    except Exception as e:
+        logger.exception("Photo analysis error")
+        await update.message.reply_text(
+            f"Не получилось разобрать фото: {e}\nПопробуй ещё раз."
+        )
+
+
 def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("Bot started")
     app.run_polling()
