@@ -6,6 +6,7 @@ import base64
 import logging
 import asyncio
 import tempfile
+import shutil
 
 import httpx
 from bs4 import BeautifulSoup
@@ -434,31 +435,46 @@ async def download_telegram_file(tg_file) -> bytes:
 
 CLOUDINARY_MAX_BYTES = 100 * 1024 * 1024  # Жёсткий лимит Cloudinary на файл на бесплатном плане
 COMPRESS_TARGET_BYTES = int(CLOUDINARY_MAX_BYTES * 0.9)  # с запасом на контейнерные накладные расходы mp4
+COMPRESS_MAX_HEIGHT = 1080  # даунскейл: декодирование 4K — самая тяжёлая часть сжатия, снижаем нагрузку
+COMPRESS_TIMEOUT_SECONDS = 480  # 4K видео минуты по 30-60 сек кодируется медленно на слабом CPU — даём запас
 
 
-async def _ffprobe_duration_seconds(path: str) -> float | None:
-    """Узнаёт длительность видео через ffprobe — нужна, чтобы посчитать целевой битрейт."""
+async def _ffprobe_video_info(path: str) -> dict | None:
+    """Узнаёт длительность и высоту видео через ffprobe — нужно для расчёта битрейта и даунскейла."""
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
+            "-select_streams", "v:0",
+            "-show_entries", "format=duration:stream=height",
+            "-of", "default=noprint_wrappers=1",
             path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
         stdout, _ = await proc.communicate()
-        return float(stdout.decode().strip())
+        info: dict = {}
+        for line in stdout.decode(errors="ignore").splitlines():
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            info[key.strip()] = value.strip()
+        duration = float(info.get("duration", 0) or 0)
+        height = int(info.get("height", 0) or 0)
+        if duration <= 0:
+            return None
+        return {"duration": duration, "height": height}
     except Exception:
-        logger.exception("ffprobe не смог определить длительность видео")
+        logger.exception("ffprobe не смог определить параметры видео")
         return None
 
 
 async def compress_video_if_needed(data: bytes) -> bytes:
     """Если видео больше лимита Cloudinary (100 МБ) — пережимает его через ffmpeg под
-    расчётный битрейт так, чтобы результат уложился в лимит. Если что-то пошло не так
-    (нет ffmpeg, не удалось определить длительность, сжатие не помогло) — возвращает
-    исходные данные без изменений, а дальше решает вызывающий код.
+    расчётный битрейт так, чтобы результат уложился в лимит (плюс даунскейл до 1080p —
+    декодирование родного 4K/60fps это самая тяжёлая по CPU часть, поэтому именно оно
+    чаще всего было причиной сбоя/долгой обработки). Если что-то пошло не так (нет
+    ffmpeg, не удалось определить параметры, сжатие не уложилось в таймаут или не
+    помогло) — возвращает исходные данные без изменений, а дальше решает вызывающий код.
     """
     if len(data) <= CLOUDINARY_MAX_BYTES:
         return data
@@ -469,31 +485,60 @@ async def compress_video_if_needed(data: bytes) -> bytes:
         with open(src_path, "wb") as f:
             f.write(data)
 
-        duration = await _ffprobe_duration_seconds(src_path)
-        if not duration or duration <= 0:
+        try:
+            free_bytes = shutil.disk_usage(tmp_dir).free
+            logger.info(
+                "Сжатие видео: исходный размер %.1f МБ, свободно на диске (%s) %.1f МБ",
+                len(data) / 1024 / 1024, tmp_dir, free_bytes / 1024 / 1024,
+            )
+        except Exception:
+            pass
+
+        info = await _ffprobe_video_info(src_path)
+        if not info:
             return data
+        duration = info["duration"]
+        height = info["height"]
 
         audio_kbps = 128
         target_total_kbps = (COMPRESS_TARGET_BYTES * 8 / 1000) / duration
         video_kbps = max(int(target_total_kbps - audio_kbps), 150)
 
-        cmd = [
-            "ffmpeg", "-y", "-i", src_path,
+        cmd = ["ffmpeg", "-y", "-i", src_path]
+        if height and height > COMPRESS_MAX_HEIGHT:
+            # Даунскейл значительно ускоряет и облегчает кодирование — декодирование
+            # исходного 4K сама по себе самая тяжёлая по CPU часть всего процесса.
+            cmd += ["-vf", f"scale=-2:{COMPRESS_MAX_HEIGHT}"]
+        cmd += [
             "-c:v", "libx264", "-preset", "veryfast",
             "-b:v", f"{video_kbps}k", "-maxrate", f"{video_kbps}k", "-bufsize", f"{video_kbps * 2}k",
             "-c:a", "aac", "-b:a", f"{audio_kbps}k",
             "-movflags", "+faststart",
             dst_path,
         ]
+
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await proc.communicate()
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=COMPRESS_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            logger.error(
+                "ffmpeg сжатие не уложилось в таймаут %s сек (длительность видео %.1f сек), убиваю процесс",
+                COMPRESS_TIMEOUT_SECONDS, duration,
+            )
+            proc.kill()
+            await proc.wait()
+            return data
 
         if proc.returncode != 0 or not os.path.exists(dst_path):
-            logger.error("ffmpeg сжатие не удалось: %s", stderr.decode(errors="ignore")[-2000:])
+            stderr_text = stderr.decode(errors="ignore")
+            logger.error(
+                "ffmpeg сжатие не удалось (код %s, длительность видео %.1f сек, height=%s): %s",
+                proc.returncode, duration, height, stderr_text[-4000:],
+            )
             return data
 
         with open(dst_path, "rb") as f:
@@ -579,14 +624,17 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if len(data) > CLOUDINARY_MAX_BYTES:
             await update.message.reply_text(
                 f"Видео весит {len(data) / 1024 / 1024:.0f} МБ — это больше 100 МБ, "
-                "лимита Cloudinary на загрузку. Сжимаю, это может занять пару минут..."
+                "лимита Cloudinary на загрузку. Сжимаю — для 4K-видео это может занять "
+                "несколько минут, не переживай, если ответ придёт не сразу..."
             )
             data = await compress_video_if_needed(data)
             if len(data) > CLOUDINARY_MAX_BYTES:
                 await update.message.reply_text(
-                    "Не получилось сжать видео до нужного размера (меньше 100 МБ).\n\n"
-                    "Сожми его вручную (например, в Telegram при отправке) или залей "
-                    "на Google Drive/Dropbox с доступом «по ссылке» и пришли мне ссылку текстом."
+                    "Не получилось сжать видео до нужного размера (меньше 100 МБ) — "
+                    "возможно, не хватило времени или ресурсов на сервере для этого конкретного файла.\n\n"
+                    "Сожми его вручную (например, в Telegram при отправке, там есть опция "
+                    "«меньший размер») или залей на Google Drive/Dropbox с доступом «по ссылке» "
+                    "и пришли мне ссылку текстом."
                 )
                 return
 
