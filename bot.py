@@ -4,6 +4,8 @@ import re
 import json
 import base64
 import logging
+import asyncio
+import tempfile
 
 import httpx
 from bs4 import BeautifulSoup
@@ -430,6 +432,78 @@ async def download_telegram_file(tg_file) -> bytes:
     return buf.getvalue()
 
 
+CLOUDINARY_MAX_BYTES = 100 * 1024 * 1024  # Жёсткий лимит Cloudinary на файл на бесплатном плане
+COMPRESS_TARGET_BYTES = int(CLOUDINARY_MAX_BYTES * 0.9)  # с запасом на контейнерные накладные расходы mp4
+
+
+async def _ffprobe_duration_seconds(path: str) -> float | None:
+    """Узнаёт длительность видео через ffprobe — нужна, чтобы посчитать целевой битрейт."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await proc.communicate()
+        return float(stdout.decode().strip())
+    except Exception:
+        logger.exception("ffprobe не смог определить длительность видео")
+        return None
+
+
+async def compress_video_if_needed(data: bytes) -> bytes:
+    """Если видео больше лимита Cloudinary (100 МБ) — пережимает его через ffmpeg под
+    расчётный битрейт так, чтобы результат уложился в лимит. Если что-то пошло не так
+    (нет ffmpeg, не удалось определить длительность, сжатие не помогло) — возвращает
+    исходные данные без изменений, а дальше решает вызывающий код.
+    """
+    if len(data) <= CLOUDINARY_MAX_BYTES:
+        return data
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        src_path = os.path.join(tmp_dir, "in.mp4")
+        dst_path = os.path.join(tmp_dir, "out.mp4")
+        with open(src_path, "wb") as f:
+            f.write(data)
+
+        duration = await _ffprobe_duration_seconds(src_path)
+        if not duration or duration <= 0:
+            return data
+
+        audio_kbps = 128
+        target_total_kbps = (COMPRESS_TARGET_BYTES * 8 / 1000) / duration
+        video_kbps = max(int(target_total_kbps - audio_kbps), 150)
+
+        cmd = [
+            "ffmpeg", "-y", "-i", src_path,
+            "-c:v", "libx264", "-preset", "veryfast",
+            "-b:v", f"{video_kbps}k", "-maxrate", f"{video_kbps}k", "-bufsize", f"{video_kbps * 2}k",
+            "-c:a", "aac", "-b:a", f"{audio_kbps}k",
+            "-movflags", "+faststart",
+            dst_path,
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+
+        if proc.returncode != 0 or not os.path.exists(dst_path):
+            logger.error("ffmpeg сжатие не удалось: %s", stderr.decode(errors="ignore")[-2000:])
+            return data
+
+        with open(dst_path, "rb") as f:
+            compressed = f.read()
+
+        if not compressed or len(compressed) >= len(data):
+            return data
+        return compressed
+
+
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Голосовые/аудио-сообщения: скачиваем, распознаём через Whisper, отвечаем как на текст."""
     if openai_client is None:
@@ -501,6 +575,21 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         tg_file = await context.bot.get_file(video.file_id)
         data = await download_telegram_file(tg_file)
+
+        if len(data) > CLOUDINARY_MAX_BYTES:
+            await update.message.reply_text(
+                f"Видео весит {len(data) / 1024 / 1024:.0f} МБ — это больше 100 МБ, "
+                "лимита Cloudinary на загрузку. Сжимаю, это может занять пару минут..."
+            )
+            data = await compress_video_if_needed(data)
+            if len(data) > CLOUDINARY_MAX_BYTES:
+                await update.message.reply_text(
+                    "Не получилось сжать видео до нужного размера (меньше 100 МБ).\n\n"
+                    "Сожми его вручную (например, в Telegram при отправке) или залей "
+                    "на Google Drive/Dropbox с доступом «по ссылке» и пришли мне ссылку текстом."
+                )
+                return
+
         buf = io.BytesIO(data)
         buf.seek(0)
 
@@ -520,10 +609,10 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except Exception as e:
         logger.exception("Video upload error")
         error_text = str(e)
-        if "too big" in error_text.lower() or "file is too big" in error_text.lower():
+        if "too big" in error_text.lower() or "file is too big" in error_text.lower() or "too large" in error_text.lower():
             await update.message.reply_text(
-                "Файл слишком большой для скачивания ботом.\n\n"
-                "Сожми видео или залей на Google Drive/Dropbox и пришли ссылку текстом."
+                "Файл слишком большой для загрузки (даже после сжатия).\n\n"
+                "Сожми видео вручную или залей на Google Drive/Dropbox и пришли ссылку."
             )
         else:
             await update.message.reply_text(

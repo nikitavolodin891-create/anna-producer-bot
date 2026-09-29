@@ -11,8 +11,10 @@ FROM aiogram/telegram-bot-api:latest AS botapi
 FROM python:3.13-alpine
 
 # Рантайм-зависимости бинарника telegram-bot-api (собран на Alpine/musl) + bash
-# (нужен start.sh для `wait -n`, которого нет в стандартном ash/busybox).
-RUN apk add --no-cache openssl libstdc++ ca-certificates bash
+# (нужен start.sh для `wait -n`, которого нет в стандартном ash/busybox) + ffmpeg
+# (нужен боту, чтобы пережимать видео больше 100 МБ перед загрузкой на Cloudinary —
+# см. compress_video_if_needed в bot.py).
+RUN apk add --no-cache openssl libstdc++ ca-certificates bash ffmpeg
 
 COPY --from=botapi /usr/local/bin/telegram-bot-api /usr/local/bin/telegram-bot-api
 
