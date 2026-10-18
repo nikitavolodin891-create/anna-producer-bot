@@ -379,7 +379,7 @@ async def ffmpeg_edit(src_path: str, dst_path: str, words: list[Word], plan: Pla
     for i, (s, e) in enumerate(segs):
         out = os.path.join(work_dir, f"seg_{i:04d}.mp4")
         vf = (zoomed if (plan.zooms and i % 2 == 1) else base) + ",setsar=1,fps=30"
-        cmd = ["ffmpeg", "-y", "-threads", FF_THREADS, "-ss", f"{s:.3f}", "-t", f"{e - s:.3f}", "-i", src_path,
+        cmd = ["ffmpeg", "-y", "-threads", FF_THREADS, "-filter_threads", FF_THREADS, "-ss", f"{s:.3f}", "-t", f"{e - s:.3f}", "-i", src_path,
                "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
                "-threads", FF_THREADS, "-x264-params", "rc-lookahead=10"]
         if info["has_audio"]:
@@ -416,7 +416,7 @@ async def ffmpeg_edit(src_path: str, dst_path: str, words: list[Word], plan: Pla
 
     ass_escaped = ass_path.replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
     fonts_escaped = FONTS_DIR.replace(":", r"\:").replace("'", r"\'")
-    cmd = ["ffmpeg", "-y", "-threads", FF_THREADS, "-i", joined,
+    cmd = ["ffmpeg", "-y", "-threads", FF_THREADS, "-filter_threads", FF_THREADS, "-i", joined,
            "-vf", f"subtitles='{ass_escaped}':fontsdir='{fonts_escaped}'",
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
            "-threads", FF_THREADS, "-x264-params", "rc-lookahead=10", "-movflags", "+faststart"]

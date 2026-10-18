@@ -253,7 +253,7 @@ async def extract_frames(path: str, count: int = MAX_FRAMES) -> list[bytes]:
     for i, t in enumerate(times):
         dst = os.path.join(out_dir, f"frame_{i}.jpg")
         code, _ = await _run(
-            "ffmpeg", "-y", "-ss", f"{t:.2f}", "-i", path, "-frames:v", "1",
+            "ffmpeg", "-y", "-threads", "2", "-filter_threads", "1", "-ss", f"{t:.2f}", "-i", path, "-frames:v", "1",
             "-vf", f"scale=-2:'min({FRAME_HEIGHT},ih)'", "-q:v", "4", dst, timeout=60,
         )
         if code == 0 and os.path.exists(dst):

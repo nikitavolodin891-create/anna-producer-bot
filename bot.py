@@ -714,7 +714,7 @@ async def extract_audio_mp3(data: bytes, suffix: str) -> bytes | None:
         with open(src, "wb") as f:
             f.write(data)
         proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-i", src, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", dst,
+            "ffmpeg", "-y", "-threads", "2", "-i", src, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", dst,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
         )
         _, stderr = await proc.communicate()
@@ -849,11 +849,11 @@ async def compress_video_if_needed(data: bytes) -> bytes:
         target_total_kbps = (COMPRESS_TARGET_BYTES * 8 / 1000) / duration
         video_kbps = max(int(target_total_kbps - audio_kbps), 150)
 
-        cmd = ["ffmpeg", "-y", "-i", src_path]
+        cmd = ["ffmpeg", "-y", "-threads", "2", "-filter_threads", "2", "-i", src_path]
         if height and height > COMPRESS_MAX_HEIGHT:
             cmd += ["-vf", f"scale=-2:{COMPRESS_MAX_HEIGHT}"]
         cmd += [
-            "-c:v", "libx264", "-preset", "veryfast",
+            "-c:v", "libx264", "-preset", "veryfast", "-threads", "2", "-x264-params", "rc-lookahead=10",
             "-b:v", f"{video_kbps}k", "-maxrate", f"{video_kbps}k", "-bufsize", f"{video_kbps * 2}k",
             "-c:a", "aac", "-b:a", f"{audio_kbps}k",
             "-movflags", "+faststart",
@@ -928,7 +928,7 @@ async def transcribe_words(video_path: str) -> tuple[list[montage.Word], str, st
     """Расшифровка с таймкодом каждого слова — по ним режем паузы и ставим субтитры."""
     audio_path = video_path + ".mp3"
     proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-y", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", audio_path,
+        "ffmpeg", "-y", "-threads", "2", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", audio_path,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
     )
     await proc.wait()
