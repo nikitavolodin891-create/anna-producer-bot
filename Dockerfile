@@ -28,6 +28,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
  && apk del .build-deps
 
 COPY *.py ./
+COPY *.ttf ./fonts/
 COPY start.sh .
 RUN chmod +x start.sh
 

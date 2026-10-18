@@ -21,8 +21,9 @@ import cloudinary
 import cloudinary.uploader
 from openai import AsyncOpenAI
 
-from prompt import SYSTEM_PROMPT as ANNA_PROMPT, LINK_ANALYSIS_PROMPT
+from prompt import SYSTEM_PROMPT as ANNA_PROMPT, LINK_ANALYSIS_PROMPT, MONTAGE_PLAN_PROMPT
 import social
+import montage
 
 logging.basicConfig(level=logging.INFO)
 # httpx пишет в лог каждый запрос к Telegram вместе с токеном бота в URL — глушим
@@ -311,7 +312,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Понимаю голосовые и кружки 🎙\n"
         "• Разбираю рилсы и посты по ссылке (Instagram, TikTok, YouTube)\n"
         "• Читаю фото, PDF и сайты\n"
-        "• Видео — пришли файлом\n\n"
+        "• Монтирую Reels: пришли видео — верну готовый ролик с субтитрами 🎬\n"
+        "  (в подписи к видео можно написать пожелания, например «динамично»)\n\n"
         "Просто напиши или наговори, что нужно.\n"
         "/new — начать новый диалог (забыть контекст)"
     )
@@ -584,7 +586,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # ---------------------------------------------------------------------------
-# Видео (заливка на Cloudinary — монтаж добавляется следующим шагом)
+# Видео: сжатие и заливка на Cloudinary (режим «просто ссылка»)
 # ---------------------------------------------------------------------------
 CLOUDINARY_MAX_BYTES = 100 * 1024 * 1024
 COMPRESS_TARGET_BYTES = int(CLOUDINARY_MAX_BYTES * 0.9)
@@ -674,23 +676,19 @@ async def compress_video_if_needed(data: bytes) -> bytes:
         return compressed if compressed and len(compressed) < len(data) else data
 
 
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Принимает видео и загружает на Cloudinary."""
-    video = update.message.video or update.message.document
-    if video is None:
-        return
+async def save_telegram_file(tg_file, dst: str) -> None:
+    """Сохраняет файл Telegram на диск, не держа его целиком в памяти."""
+    file_path = tg_file.file_path
+    if file_path and os.path.isabs(file_path) and os.path.exists(file_path):
+        shutil.copyfile(file_path, dst)
+    else:
+        await tg_file.download_to_drive(dst)
 
-    file_size = getattr(video, "file_size", None)
-    if file_size and file_size > TELEGRAM_BOT_FILE_LIMIT:
-        await update.message.reply_text(
-            f"Файл весит {file_size / 1048576:.0f} МБ — это больше лимита 2 ГБ.\n"
-            "Залей на Google Drive/Dropbox с доступом «по ссылке» и пришли ссылку."
-        )
-        return
 
+async def upload_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE, video) -> None:
+    """Старый режим: просто загрузить видео на Cloudinary и дать публичную ссылку."""
     status = await update.message.reply_text("Загружаю видео, подожди немного...")
     await update.effective_chat.send_action("upload_video")
-
     try:
         tg_file = await context.bot.get_file(video.file_id)
         data = await download_telegram_file(tg_file)
@@ -708,22 +706,251 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 )
                 return
 
-        buf = io.BytesIO(data)
         upload_result = await asyncio.to_thread(
-            cloudinary.uploader.upload_large, buf, resource_type="video", folder="anna_producer_bot",
+            cloudinary.uploader.upload_large, io.BytesIO(data), resource_type="video", folder="anna_producer_bot",
         )
-        public_url = upload_result["secure_url"]
-
-        await update.message.reply_text(
-            "Готово! Публичная ссылка на видео:\n\n"
-            f"{public_url}\n\n"
-            "Вставь эту ссылку в чат с агентом «Анна» в Claude (Project) — там подключён монтаж."
-        )
+        await update.message.reply_text(f"Готово! Публичная ссылка на видео:\n\n{upload_result['secure_url']}")
     except Exception as e:
         logger.exception("Video upload error")
-        await update.message.reply_text(
-            f"Не получилось загрузить видео: {e}\nПопробуй ещё раз или залей на Google Drive и пришли ссылку."
+        await update.message.reply_text(f"Не получилось загрузить видео: {e}\nПопробуй ещё раз.")
+
+
+# ---------------------------------------------------------------------------
+# Автомонтаж
+# ---------------------------------------------------------------------------
+LINK_MODE_RE = re.compile(r"(ссылк|cloudinary|без монтажа|не монтир)", re.I)
+MONTAGE_MAX_SECONDS = int(os.environ.get("MONTAGE_MAX_SECONDS", "600"))  # до 10 минут исходника
+WHISPER_LANGS = {"russian": "ru", "english": "en", "ukrainian": "uk", "spanish": "es", "german": "de", "french": "fr"}
+
+
+async def transcribe_words(video_path: str) -> tuple[list[montage.Word], str, str]:
+    """Расшифровка с таймкодом каждого слова — по ним режем паузы и ставим субтитры."""
+    audio_path = video_path + ".mp3"
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", audio_path,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    await proc.wait()
+    if proc.returncode != 0 or not os.path.exists(audio_path):
+        return [], "", "ru"
+    if os.path.getsize(audio_path) > WHISPER_MAX_BYTES:
+        raise RuntimeError("видео слишком длинное для расшифровки")
+    with open(audio_path, "rb") as f:
+        resp = await openai_client.audio.transcriptions.create(
+            model="whisper-1",
+            file=("audio.mp3", f.read()),
+            response_format="verbose_json",
+            timestamp_granularities=["word"],
         )
+    words = [
+        montage.Word(w.word.strip(), float(w.start), float(w.end))
+        for w in (getattr(resp, "words", None) or [])
+        if w.word.strip()
+    ]
+    lang = WHISPER_LANGS.get((getattr(resp, "language", "") or "").lower(), "ru")
+    return words, (resp.text or "").strip(), lang
+
+
+async def make_montage_plan(transcript: str, wishes: str) -> montage.Plan:
+    """Claude-продюсер решает: хук-заголовок, темп, наезды/перебивки, подпись к посту."""
+    if not transcript and not wishes:
+        return montage.Plan(hook_title="")
+    prompt = MONTAGE_PLAN_PROMPT.format(
+        transcript=transcript[:8000] or "(речи нет или не распознана)",
+        wishes=wishes or "(нет — реши сама как продюсер)",
+    )
+    try:
+        resp = await client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=2500,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = "".join(b.text for b in resp.content if b.type == "text")
+        return montage.parse_plan(text)
+    except Exception:
+        logger.exception("Не удалось составить план монтажа")
+        return montage.Plan()
+
+
+def _mmss(seconds: float) -> str:
+    seconds = int(round(seconds))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+async def remember(chat_id: int, user_note: str, assistant_text: str) -> None:
+    async with chat_locks[chat_id]:
+        history = conversations.get(chat_id, []) + [
+            {"role": "user", "content": user_note},
+            {"role": "assistant", "content": assistant_text},
+        ]
+        conversations[chat_id] = _sanitize_history(history[-MAX_HISTORY_MESSAGES:])
+        _save_conversations()
+
+
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Видео → автомонтаж. Если в подписи «ссылка» / «без монтажа» — просто публичная ссылка."""
+    msg = update.message
+    video = msg.video or msg.document
+    if video is None:
+        return
+
+    file_size = getattr(video, "file_size", None)
+    if file_size and file_size > TELEGRAM_BOT_FILE_LIMIT:
+        await msg.reply_text(
+            f"Файл весит {file_size / 1048576:.0f} МБ — это больше лимита 2 ГБ.\n"
+            "Сожми его при отправке или пришли покороче."
+        )
+        return
+
+    caption = (msg.caption or "").strip()
+    if LINK_MODE_RE.search(caption):
+        await upload_video_link(update, context, video)
+        return
+    await montage_video(update, context, video, caption)
+
+
+async def montage_video(update: Update, context: ContextTypes.DEFAULT_TYPE, video, wishes: str) -> None:
+    chat_id = update.effective_chat.id
+    steps: list[str] = []
+    status = await update.message.reply_text("🎬 Принял видео — монтирую. Это займёт несколько минут.\n\n⏳ Скачиваю...")
+
+    async def step(done: str | None, now: str | None) -> None:
+        if done:
+            steps.append(f"✅ {done}")
+        text = "🎬 Монтаж\n\n" + "\n".join(steps) + (f"\n⏳ {now}" if now else "")
+        try:
+            await status.edit_text(text)
+        except BadRequest:
+            pass
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "source.mp4")
+        try:
+            tg_file = await context.bot.get_file(video.file_id)
+            await save_telegram_file(tg_file, src)
+            info = await montage.probe(src)
+        except montage.MontageError as e:
+            await step(None, None)
+            await update.message.reply_text(f"Не получилось открыть видео: {e}")
+            return
+        except Exception:
+            logger.exception("Montage download error")
+            await update.message.reply_text("Не получилось скачать видео. Попробуй отправить ещё раз.")
+            return
+
+        if info["duration"] > MONTAGE_MAX_SECONDS:
+            await status.edit_text(
+                f"Видео длится {_mmss(info['duration'])} — для Reels это слишком долго "
+                f"(монтирую до {_mmss(MONTAGE_MAX_SECONDS)}). Пришли фрагмент покороче."
+            )
+            return
+
+        # 1. Расшифровка речи с таймкодами слов
+        words, transcript, lang = [], "", "ru"
+        if info["has_audio"] and openai_client is not None:
+            await step(f"Скачала ({_mmss(info['duration'])})", "Слушаю и расшифровываю речь...")
+            try:
+                words, transcript, lang = await transcribe_words(src)
+            except Exception:
+                logger.exception("Montage transcription error")
+        else:
+            await step(f"Скачала ({_mmss(info['duration'])})", None)
+
+        # 2. Продюсерский план
+        await step("Расшифровала речь" if transcript else "Речи нет — монтирую по картинке", "Продюсирую: хук, темп, подпись к посту...")
+        plan = await make_montage_plan(transcript, wishes)
+
+        # 3. Монтаж: Submagic → запасной свой
+        result = os.path.join(tmp, "final.mp4")
+        engine = None
+        fallback_note = ""
+        if montage.submagic_enabled():
+            await step("Продумала хук и подпись", "Монтирую в Submagic: субтитры, наезды, паузы (обычно 2–5 минут)...")
+
+            async def on_progress(s):
+                labels = {"processing": "обрабатывает", "transcribing": "расшифровывает", "exporting": "рендерит видео"}
+                if s in labels:
+                    await step(None, f"Submagic {labels[s]}...")
+            try:
+                url = await montage.submagic_edit(src, lang, plan, plan.hook_title or "Reels", on_progress=on_progress)
+                await montage.download_file(url, result)
+                engine = "Submagic"
+            except Exception as e:
+                logger.exception("Submagic error")
+                fallback_note = f"Submagic не сработал ({e}) — смонтировала сама."
+                await step(None, "Submagic не сработал — монтирую сама...")
+        else:
+            await step("Продумала хук и подпись", "Монтирую: режу паузы, ставлю субтитры и наезды...")
+
+        stats = None
+        if engine is None:
+            try:
+                stats = await montage.ffmpeg_edit(src, result, words, plan, tmp)
+                engine = "ffmpeg"
+            except montage.MontageError as e:
+                await step(None, None)
+                await update.message.reply_text(f"Не получилось смонтировать: {e}")
+                return
+            except Exception:
+                logger.exception("ffmpeg montage error")
+                await update.message.reply_text("Не получилось смонтировать видео. Попробуй ещё раз.")
+                return
+
+        await step("Смонтировала", "Отправляю видео...")
+        try:
+            final_info = await montage.probe(result)
+        except Exception:
+            final_info = {"duration": 0}
+
+        if stats:
+            summary = (
+                f"✂️ Было {_mmss(stats['original'])} → стало {_mmss(stats['final'])}, "
+                f"вырезала пауз: {stats['cuts']}"
+            )
+        else:
+            summary = f"✂️ Смонтировано в Submagic · {_mmss(final_info.get('duration', 0))}"
+        if fallback_note:
+            summary += f"\n⚠️ {fallback_note}"
+
+        await update.effective_chat.send_action("upload_video")
+        try:
+            with open(result, "rb") as f:
+                await update.message.reply_video(
+                    video=f,
+                    caption=summary[:1000],
+                    supports_streaming=True,
+                    width=1080,
+                    height=1920,
+                    duration=int(final_info.get("duration") or 0) or None,
+                    read_timeout=600,
+                    write_timeout=600,
+                )
+        except Exception:
+            logger.exception("Send video error")
+            await update.message.reply_text("Видео смонтировано, но не получилось отправить его в Telegram. Попробуй ещё раз.")
+            return
+
+    try:
+        await status.delete()
+    except Exception:
+        pass
+
+    parts = []
+    if plan.comment:
+        parts.append(f"**Комментарий продюсера:** {plan.comment}")
+    if plan.hook_title:
+        parts.append(f"**Хук на экране:** {plan.hook_title}")
+    if plan.post_caption:
+        parts.append(f"**Подпись к посту:**\n\n{plan.post_caption}")
+    text = "\n\n".join(parts)
+    if text:
+        await send_long(update, text)
+
+    note = "[Прислала видео на монтаж]" + (f" Пожелания: {wishes}" if wishes else "")
+    if transcript:
+        note += f"\nРасшифровка ролика: {transcript[:4000]}"
+    await remember(chat_id, note, text or "[Смонтировала видео]")
 
 
 # ---------------------------------------------------------------------------
