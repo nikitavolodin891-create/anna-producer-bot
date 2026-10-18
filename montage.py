@@ -36,6 +36,8 @@ CUT_PAD = 0.12        # запас вокруг слов, чтобы не обр
 ZOOM = 1.12           # наезд на чередующихся фразах
 WORDS_PER_CAPTION = 3
 FFMPEG_TIMEOUT = 20 * 60
+# потоки ffmpeg: меньше потоков — меньше памяти (на пробном тарифе Railway её мало)
+FF_THREADS = os.environ.get("FFMPEG_THREADS", "2")
 
 
 class MontageError(Exception):
@@ -247,18 +249,19 @@ def keep_segments(words: list[Word], duration: float) -> list[tuple[float, float
     return [(round(s, 3), round(e, 3)) for s, e in segs if e - s >= 0.15]
 
 
-def retime_words(words: list[Word], segs: list[tuple[float, float]]) -> list[Word]:
-    """Пересчитывает время слов под смонтированное видео (после вырезки пауз)."""
+def retime_words(words: list[Word], segs: list[tuple[float, float]], durations: list[float] | None = None) -> list[Word]:
+    """Пересчитывает время слов под смонтированное видео (после вырезки пауз).
+    durations — реальные длительности нарезанных кусков (могут отличаться на доли кадра)."""
     out: list[Word] = []
     offset = 0.0
-    for s, e in segs:
+    for idx, (s, e) in enumerate(segs):
         for w in words:
             mid = (w.start + w.end) / 2
             if s <= mid <= e:
                 ns = offset + max(w.start, s) - s
                 ne = offset + min(w.end, e) - s
                 out.append(Word(w.text, round(ns, 3), round(max(ne, ns + 0.08), 3)))
-        offset += e - s
+        offset += durations[idx] if durations and idx < len(durations) and durations[idx] > 0 else e - s
     return out
 
 
@@ -345,53 +348,81 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return header + "\n".join(events) + "\n"
 
 
+async def _duration(path: str) -> float:
+    code, out = await _run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path], timeout=60)
+    try:
+        return float(out.strip()) if code == 0 else 0.0
+    except ValueError:
+        return 0.0
+
+
 async def ffmpeg_edit(src_path: str, dst_path: str, words: list[Word], plan: Plan, work_dir: str) -> dict:
-    """Свой монтаж: паузы → 9:16 → наезды → субтитры → хук-заголовок."""
+    """Свой монтаж: паузы → 9:16 → наезды → субтитры → хук-заголовок.
+
+    Экономно по памяти (сервер маленький): каждый фрагмент режется отдельным процессом,
+    затем склейка без перекодирования и финальный проход с субтитрами. Память не растёт
+    с длиной видео.
+    """
     info = await probe(src_path)
     duration = info["duration"]
     if duration <= 0:
         raise MontageError("не получилось определить длительность видео")
 
     segs = keep_segments(words, duration) if info["has_audio"] else [(0.0, duration)]
-    new_words = retime_words(words, segs)
-    total = sum(e - s for s, e in segs)
-
-    ass_path = os.path.join(work_dir, "subs.ass")
-    with open(ass_path, "w", encoding="utf-8") as f:
-        f.write(build_ass(new_words, total, plan.hook_title, plan.captions))
-
     base = f"scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=increase,crop={OUT_W}:{OUT_H}"
     zw, zh = int(OUT_W * ZOOM) // 2 * 2, int(OUT_H * ZOOM) // 2 * 2
     zoomed = f"scale={zw}:{zh}:force_original_aspect_ratio=increase,crop={OUT_W}:{OUT_H}"
 
-    parts: list[str] = []
-    concat_inputs = ""
+    # 1. Нарезка фрагментов (по одному процессу на фрагмент)
+    seg_files: list[str] = []
+    durations: list[float] = []
     for i, (s, e) in enumerate(segs):
-        vf = zoomed if (plan.zooms and i % 2 == 1) else base
-        parts.append(f"[0:v]trim=start={s}:end={e},setpts=PTS-STARTPTS,{vf},setsar=1,fps=30[v{i}]")
+        out = os.path.join(work_dir, f"seg_{i:04d}.mp4")
+        vf = (zoomed if (plan.zooms and i % 2 == 1) else base) + ",setsar=1,fps=30"
+        cmd = ["ffmpeg", "-y", "-threads", FF_THREADS, "-ss", f"{s:.3f}", "-t", f"{e - s:.3f}", "-i", src_path,
+               "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+               "-threads", FF_THREADS, "-x264-params", "rc-lookahead=10"]
         if info["has_audio"]:
-            parts.append(f"[0:a]atrim=start={s}:end={e},asetpts=PTS-STARTPTS[a{i}]")
-            concat_inputs += f"[v{i}][a{i}]"
+            cmd += ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
         else:
-            concat_inputs += f"[v{i}]"
-    a_flag = 1 if info["has_audio"] else 0
-    parts.append(f"{concat_inputs}concat=n={len(segs)}:v=1:a={a_flag}[vc]" + ("[ac]" if a_flag else ""))
-    ass_escaped = ass_path.replace("\\", "/").replace(":", r"\:")
-    fonts_escaped = FONTS_DIR.replace(":", r"\:")
-    parts.append(f"[vc]subtitles='{ass_escaped}':fontsdir='{fonts_escaped}'[vout]")
+            cmd += ["-an"]
+        cmd.append(out)
+        code, _ = await _run(cmd, timeout=600)
+        if code != 0 or not os.path.exists(out):
+            raise MontageError("монтаж не получился (ошибка при нарезке)" if code != -1 else "монтаж занял слишком много времени")
+        seg_files.append(out)
+        durations.append(await _duration(out))
 
-    script_path = os.path.join(work_dir, "graph.txt")
-    with open(script_path, "w", encoding="utf-8") as f:
-        f.write(";\n".join(parts))
+    # 2. Склейка без перекодирования
+    list_path = os.path.join(work_dir, "list.txt")
+    with open(list_path, "w", encoding="utf-8") as f:
+        f.writelines(f"file '{p}'\n" for p in seg_files)
+    joined = os.path.join(work_dir, "joined.mp4")
+    code, _ = await _run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", joined], timeout=600)
+    if code != 0 or not os.path.exists(joined):
+        raise MontageError("монтаж не получился (ошибка при склейке)")
+    for p in seg_files:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
 
-    cmd = ["ffmpeg", "-y", "-i", src_path, "-filter_complex_script", script_path, "-map", "[vout]"]
-    if a_flag:
-        cmd += ["-map", "[ac]", "-c:a", "aac", "-b:a", "160k", "-ar", "48000"]
-    cmd += [
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart", "-threads", "0", dst_path,
-    ]
+    # 3. Субтитры и хук-заголовок — по реальным длительностям кусков
+    total = await _duration(joined) or sum(durations)
+    new_words = retime_words(words, segs, durations)
+    ass_path = os.path.join(work_dir, "subs.ass")
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write(build_ass(new_words, total, plan.hook_title, plan.captions))
+
+    ass_escaped = ass_path.replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
+    fonts_escaped = FONTS_DIR.replace(":", r"\:").replace("'", r"\'")
+    cmd = ["ffmpeg", "-y", "-threads", FF_THREADS, "-i", joined,
+           "-vf", f"subtitles='{ass_escaped}':fontsdir='{fonts_escaped}'",
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
+           "-threads", FF_THREADS, "-x264-params", "rc-lookahead=10", "-movflags", "+faststart"]
+    cmd += ["-c:a", "aac", "-b:a", "160k"] if info["has_audio"] else ["-an"]
+    cmd.append(dst_path)
     code, _ = await _run(cmd, timeout=FFMPEG_TIMEOUT)
     if code != 0 or not os.path.exists(dst_path):
-        raise MontageError("монтаж не получился (ошибка ffmpeg)" if code != -1 else "монтаж занял слишком много времени")
+        raise MontageError("монтаж не получился (ошибка при наложении субтитров)" if code != -1 else "монтаж занял слишком много времени")
     return {"original": duration, "final": total, "cuts": max(len(segs) - 1, 0)}
