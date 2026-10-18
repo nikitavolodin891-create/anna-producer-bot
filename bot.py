@@ -8,6 +8,8 @@ import logging
 import asyncio
 import tempfile
 import shutil
+import time
+import types
 from collections import defaultdict
 
 import httpx
@@ -146,10 +148,57 @@ def current_system_prompt() -> str:
     return prompt
 
 
+# Ответы старой версии бота «я текстовый, монтировать не могу» — неправда с тех пор, как появился
+# автомонтаж. Если их оставить в истории, Claude будет их повторять. Вырезаем такие пары.
+STALE_REPLY_RE = re.compile(
+    r"(текстов(ый|ая)\s+(бот|ии|ассистент)|не\s+(могу|умею)\s+(сама?\s+)?(монтир|смонтир)|монтаж\s+видео\s+не\s+мой|"
+    r"нет\s+(здесь\s+)?доступа\s+к\s+монтаж)",
+    re.I,
+)
+
+
+def _drop_stale_replies(history: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for msg in history:
+        if msg.get("role") == "assistant" and isinstance(msg.get("content"), str) and STALE_REPLY_RE.search(msg["content"]):
+            if out and out[-1].get("role") == "user":
+                out.pop()  # вопрос, на который был дан устаревший ответ
+            continue
+        out.append(msg)
+    return out
+
+
 conversations: dict[int, list[dict]] = {
-    chat_id: _sanitize_history(h) for chat_id, h in _load_conversations().items()
+    chat_id: _sanitize_history(_drop_stale_replies(h)) for chat_id, h in _load_conversations().items()
 }
 chat_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+LAST_VIDEO_FILE = os.path.join(DATA_DIR, "last_videos.json")
+LAST_VIDEO_TTL = 3 * 24 * 3600  # «смонтируй» без видео — берём последнее, присланное за 3 дня
+
+
+def _load_last_videos() -> dict[int, dict]:
+    try:
+        with open(LAST_VIDEO_FILE, encoding="utf-8") as f:
+            return {int(k): v for k, v in json.load(f).items()}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    except Exception:
+        logger.exception("Не удалось прочитать last_videos")
+        return {}
+
+
+last_videos: dict[int, dict] = _load_last_videos()
+
+
+def remember_video(chat_id: int, file_id: str, file_size: int | None) -> None:
+    last_videos[chat_id] = {"file_id": file_id, "file_size": file_size, "at": time.time()}
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(LAST_VIDEO_FILE, "w", encoding="utf-8") as f:
+            json.dump(last_videos, f)
+    except Exception:
+        logger.exception("Не удалось сохранить last_videos")
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +638,9 @@ async def process_user_text(update: Update, user_text: str) -> None:
     urls = URL_RE.findall(user_text)[:MAX_LINKS_PER_MESSAGE]
 
     if not urls:
+        if MONTAGE_INTENT_RE.search(user_text):
+            await montage_from_text(update, user_text)
+            return
         if TRENDS_INTENT_RE.search(user_text):
             await run_trends(update, topic=user_text)
             return
@@ -989,6 +1041,26 @@ async def remember(chat_id: int, user_note: str, assistant_text: str) -> None:
         _save_conversations()
 
 
+MONTAGE_INTENT_RE = re.compile(r"(смонтир|отмонтир|перемонтир|монтаж|монтир|нарежь|наложи\s+субтитр|сделай\s+(из\s+)?(этого\s+)?(видео|ролик|рилс))", re.I)
+
+
+async def montage_from_text(update: Update, wishes: str) -> None:
+    """«Сделай монтаж» текстом/голосом → монтируем последнее присланное видео."""
+    chat_id = update.effective_chat.id
+    saved = last_videos.get(chat_id)
+    if not saved or time.time() - saved.get("at", 0) > LAST_VIDEO_TTL:
+        await update.effective_message.reply_text(
+            "Конечно смонтирую 🎬 Пришли видео файлом: скрепка → Галерея → выбери ролик.\n\n"
+            "В подписи к видео можно сразу написать пожелания: «динамично», «спокойно», «без субтитров», "
+            "«с перебивками». Через пару минут верну готовый ролик с субтитрами, хуком и подписью к посту."
+        )
+        return
+    await update.effective_message.reply_text("Беру последнее видео, которое ты присылала 👌")
+    video = types.SimpleNamespace(file_id=saved["file_id"], file_size=saved.get("file_size"))
+    context = types.SimpleNamespace(bot=update.get_bot())
+    await montage_video(update, context, video, wishes)
+
+
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Видео → автомонтаж. Если в подписи «ссылка» / «без монтажа» — просто публичная ссылка."""
     msg = update.message
@@ -1004,6 +1076,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
+    remember_video(update.effective_chat.id, video.file_id, file_size)
     caption = (msg.caption or "").strip()
     if LINK_MODE_RE.search(caption):
         await upload_video_link(update, context, video)
@@ -1013,6 +1086,8 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def montage_video(update: Update, context: ContextTypes.DEFAULT_TYPE, video, wishes: str) -> None:
     chat_id = update.effective_chat.id
+    logger.info("Montage start: chat=%s size=%s submagic=%s wishes=%r", chat_id,
+                getattr(video, "file_size", None), montage.submagic_enabled(), wishes[:100])
     steps: list[str] = []
     status = await update.message.reply_text("🎬 Принял видео — монтирую. Это займёт несколько минут.\n\n⏳ Скачиваю...")
 
