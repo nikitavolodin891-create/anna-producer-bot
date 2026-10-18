@@ -23,6 +23,7 @@ from prompt import SYSTEM_PROMPT as ANNA_PROMPT, LINK_ANALYSIS_PROMPT, VIDEO_REV
 import social
 import audit
 import trends
+import facts
 
 logging.basicConfig(level=logging.INFO)
 # httpx пишет в лог каждый запрос к Telegram вместе с токеном бота в URL — глушим
@@ -131,6 +132,15 @@ def current_system_prompt() -> str:
         prompt += (
             f"\n=== ТРЕНДЫ НИШИ (собраны ботом {trend_mem['date']}) ===\n" + trend_mem["summary"]
             + "\nУчитывай их, когда предлагаешь хуки и идеи (если они не устарели — старше недели считай ориентиром, а не фактом).\n"
+        )
+    facts_text = facts.prompt_block(DATA_DIR)
+    if facts_text:
+        prompt += (
+            "\n=== РЕАЛЬНЫЕ ИСТОРИИ И ФАКТЫ АННЫ (рассказала сама — это правда, используй смело) ===\n"
+            + facts_text
+            + "\nКогда пишешь сценарии и подписи, в первую очередь строй их на этих историях и фактах: "
+            "конкретные детали, сцены, цифры отсюда можно использовать дословно. Пометку [вставь…] ставь, "
+            "только если подходящей истории здесь нет.\n"
         )
     return prompt
 
@@ -284,6 +294,14 @@ def needs_editing(text: str) -> bool:
     return EDITOR_ENABLED and len(text) > 600 and bool(CONTENT_MARKERS_RE.search(text))
 
 
+def _editor_facts() -> str:
+    block = facts.prompt_block(DATA_DIR)
+    if not block:
+        return ""
+    return ("\n\nРЕАЛЬНЫЕ ИСТОРИИ И ФАКТЫ АННЫ (рассказала сама — это НЕ выдумка, такие детали НЕ заменяй "
+            "на [вставь…] и не удаляй):\n" + block)
+
+
 async def edit_draft(draft: str, max_tokens: int) -> str:
     """Второй проход: редактор вычищает тройки, выдуманную биографию, повторы призывов.
     Если что-то пошло не так — возвращаем черновик как есть (ответ пользователь получит в любом случае)."""
@@ -293,7 +311,7 @@ async def edit_draft(draft: str, max_tokens: int) -> str:
         resp = await client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=max_tokens,
-            system=EDITOR_PROMPT,
+            system=EDITOR_PROMPT + _editor_facts(),
             messages=[{"role": "user", "content": f"ЧЕРНОВИК:\n\n{body}"}],
         )
         edited = "".join(b.text for b in resp.content if b.type == "text").strip()
@@ -373,7 +391,41 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/trends — что сейчас залетает в нише + 15 хуков для тебя\n"
         "/audit — аудит твоего Инстаграма (или /audit @ник — любого аккаунта)\n"
         "/competitors — аккаунты-ориентиры для трендов\n"
+        "/memory — что я о тебе помню (добавить: «Запомни: …»)\n"
         "/new — начать новый диалог (забыть контекст)"
+    )
+
+
+async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    items = facts.load(DATA_DIR)
+    if not items:
+        await update.message.reply_text(
+            "Память пока пустая.\n\nНапиши или надиктуй: «Запомни: …» — историю из жизни, факт о себе, "
+            "даты ретрита, цены, — и я буду писать сценарии на твоём реальном материале."
+        )
+        return
+    lines = [f"{i}. ({it.get('date', '')}) {it['text'][:300]}{'…' if len(it['text']) > 300 else ''}" for i, it in enumerate(items, 1)]
+    text = "🧠 Что я о тебе помню:\n\n" + "\n\n".join(lines) + "\n\nУдалить: /forget номер"
+    for chunk in split_text(text):
+        await update.message.reply_text(chunk)
+
+
+async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    arg = (context.args or [""])[0]
+    if not arg.isdigit():
+        await update.message.reply_text("Напиши номер записи: /forget 3 (список — /memory)")
+        return
+    removed = facts.remove(DATA_DIR, int(arg))
+    await update.message.reply_text(
+        f"Удалила: «{removed['text'][:150]}»" if removed else "Нет записи с таким номером. Список — /memory"
+    )
+
+
+async def remember_fact(update: Update, text: str) -> None:
+    n = facts.add(DATA_DIR, text)
+    await update.effective_message.reply_text(
+        f"🧠 Запомнила (запись №{n}). Теперь буду использовать это в сценариях и подписях.\n"
+        "Посмотреть всё — /memory"
     )
 
 
@@ -610,6 +662,11 @@ async def process_user_text(update: Update, user_text: str) -> None:
     """Общая обработка текста — и набранного, и распознанного из голосового/кружка."""
     chat_id = update.effective_chat.id
     urls = URL_RE.findall(user_text)[:MAX_LINKS_PER_MESSAGE]
+
+    to_remember = facts.extract(user_text)
+    if to_remember:
+        await remember_fact(update, to_remember)
+        return
 
     if not urls:
         if TRENDS_INTENT_RE.search(user_text):
@@ -1050,6 +1107,8 @@ def main() -> None:
     app.add_handler(CommandHandler("id", show_id))
     app.add_handler(CommandHandler("start", guarded(start)))
     app.add_handler(CommandHandler("new", guarded(new_dialog)))
+    app.add_handler(CommandHandler("memory", guarded(memory_command)))
+    app.add_handler(CommandHandler("forget", guarded(forget_command)))
     app.add_handler(CommandHandler("audit", guarded(audit_command)))
     app.add_handler(CommandHandler(["trends", "hooks"], guarded(trends_command)))
     app.add_handler(CommandHandler("competitors", guarded(competitors_command)))
