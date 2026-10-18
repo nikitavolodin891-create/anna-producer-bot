@@ -101,6 +101,7 @@ def _post_row(p: dict) -> dict:
         "plays": plays,
         "likes": likes,
         "comments": comments,
+        "shares": p.get("sharesCount"),
         "duration": p.get("videoDuration"),
         "dt": dt,
         "caption": (p.get("caption") or "").strip(),
@@ -220,7 +221,7 @@ def stats_text(s: dict) -> str:
         cap = r["caption"].replace("\n", " ")[:220]
         return (
             f"{i}. {r['kind']}{dur} · {when} · просмотры {_n(r['plays'])}{x} · лайки {_n(r['likes'])} · "
-            f"комм. {_n(r['comments'])}{' · закреп' if r['pinned'] else ''}\n   {r['url']}\n   Подпись: {cap or '(нет)'}"
+            f"комм. {_n(r['comments'])}" + (f" · репосты {_n(r['shares'])}" if r.get('shares') is not None else "") + f"{' · закреп' if r['pinned'] else ''}\n   {r['url']}\n   Подпись: {cap or '(нет)'}"
         )
 
     if s["top"]:
@@ -284,9 +285,13 @@ def save_audit(data_dir: str, handle: str, summary: str) -> None:
 
 
 def load_client_audit(data_dir: str) -> dict | None:
+    return load_memory(data_dir, CLIENT_INSTAGRAM)
+
+
+def load_memory(data_dir: str, key: str) -> dict | None:
     try:
         with open(_audit_path(data_dir), encoding="utf-8") as f:
-            return json.load(f).get(CLIENT_INSTAGRAM.lower())
+            return json.load(f).get(key.lower())
     except (FileNotFoundError, json.JSONDecodeError):
         return None
     except Exception:

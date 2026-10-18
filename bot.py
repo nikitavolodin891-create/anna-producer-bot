@@ -21,10 +21,11 @@ import cloudinary
 import cloudinary.uploader
 from openai import AsyncOpenAI
 
-from prompt import SYSTEM_PROMPT as ANNA_PROMPT, LINK_ANALYSIS_PROMPT, MONTAGE_PLAN_PROMPT, AUDIT_PROMPT
+from prompt import SYSTEM_PROMPT as ANNA_PROMPT, LINK_ANALYSIS_PROMPT, MONTAGE_PLAN_PROMPT, AUDIT_PROMPT, TRENDS_PROMPT
 import social
 import montage
 import audit
+import trends
 
 logging.basicConfig(level=logging.INFO)
 # httpx пишет в лог каждый запрос к Telegram вместе с токеном бота в URL — глушим
@@ -128,15 +129,21 @@ MEMORY_RE = re.compile(r"<memory>(.*?)</memory>", re.DOTALL)
 
 def current_system_prompt() -> str:
     """Промпт Анны + свежие факты из последнего аудита её аккаунта (если он был)."""
+    prompt = SYSTEM_PROMPT
     saved = audit.load_client_audit(DATA_DIR)
-    if not saved:
-        return SYSTEM_PROMPT
-    return (
-        SYSTEM_PROMPT
-        + f"\n\n=== ЖИВЫЕ ДАННЫЕ АККАУНТА @{audit.CLIENT_INSTAGRAM} (аудит ботом от {saved['date']}) ===\n"
-        + saved["summary"]
-        + "\nОпирайся на эти данные, когда советуешь темы, хуки и форматы. Они свежее, чем аудит выше.\n"
-    )
+    if saved:
+        prompt += (
+            f"\n\n=== ЖИВЫЕ ДАННЫЕ АККАУНТА @{audit.CLIENT_INSTAGRAM} (аудит ботом от {saved['date']}) ===\n"
+            + saved["summary"]
+            + "\nОпирайся на эти данные, когда советуешь темы, хуки и форматы. Они свежее, чем аудит выше.\n"
+        )
+    trend_mem = audit.load_memory(DATA_DIR, "__trends__")
+    if trend_mem:
+        prompt += (
+            f"\n=== ТРЕНДЫ НИШИ (собраны ботом {trend_mem['date']}) ===\n" + trend_mem["summary"]
+            + "\nУчитывай их, когда предлагаешь хуки и идеи (если они не устарели — старше недели считай ориентиром, а не фактом).\n"
+        )
+    return prompt
 
 
 conversations: dict[int, list[dict]] = {
@@ -331,6 +338,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Идеи, хуки и сценарии Reels в твоём голосе\n"
         "• Подписи к постам, разбор того, что заходит\n"
         "• Анализирую твой Инстаграм и аккаунты конкурентов (кинь ссылку на профиль)\n"
+        "• Нахожу, что сейчас в тренде в нише, и пишу хуки под тебя\n"
+        "• Разбираю скриншоты статистики (досмотры, сохранения)\n"
         "• Отвечаю на любые вопросы — про контент, бизнес и просто жизнь\n"
         "• Понимаю голосовые и кружки 🎙\n"
         "• Разбираю рилсы и посты по ссылке (Instagram, TikTok, YouTube)\n"
@@ -338,7 +347,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Монтирую Reels: пришли видео — верну готовый ролик с субтитрами 🎬\n"
         "  (в подписи к видео можно написать пожелания, например «динамично»)\n\n"
         "Просто напиши или наговори, что нужно.\n"
+        "/trends — что сейчас залетает в нише + 15 хуков для тебя\n"
         "/audit — аудит твоего Инстаграма (или /audit @ник — любого аккаунта)\n"
+        "/competitors — аккаунты-ориентиры для трендов\n"
         "/new — начать новый диалог (забыть контекст)"
     )
 
@@ -426,6 +437,89 @@ async def run_audit(update: Update, handle: str, extra: str = "") -> None:
 
 
 # ---------------------------------------------------------------------------
+# Тренды ниши
+# ---------------------------------------------------------------------------
+TRENDS_INTENT_RE = re.compile(
+    r"(тренд|залета|залетел|виральн|вирусн|в топе|что сейчас (снимают|заходит|популярн)|"
+    r"популярн\w*\s+(сейчас\s+)?(хук|тем|ролик|рилс|reels))",
+    re.I,
+)
+
+
+async def trends_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args or []
+    force = bool(args and args[0].lower() in ("обнови", "refresh", "!"))
+    if force:
+        args = args[1:]
+    hashtags = [a.lstrip("#").lower() for a in args if a.strip("#")] or None
+    await run_trends(update, hashtags=hashtags, force=force)
+
+
+async def competitors_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/competitors — список; /competitors @a @b — добавить; /competitors удалить @a; /competitors очистить."""
+    args = " ".join(context.args or []).strip()
+    current = trends.load_competitors(DATA_DIR)
+    low = args.lower()
+    if low in ("очистить", "clear"):
+        current = []
+        trends.save_competitors(DATA_DIR, current)
+    elif low.startswith(("удалить", "убрать", "remove", "-")):
+        drop = {h.lower() for h in trends.parse_handles(re.sub(r"^(удалить|убрать|remove|-)", "", args, flags=re.I))}
+        current = [h for h in current if h.lower() not in drop]
+        trends.save_competitors(DATA_DIR, current)
+    elif args:
+        new = [h for h in trends.parse_handles(args) if h.lower() not in {c.lower() for c in current}]
+        current = (current + new)[: trends.MAX_ACCOUNTS]
+        trends.save_competitors(DATA_DIR, current)
+    listing = "\n".join(f"• @{h}" for h in current) or "пока пусто"
+    await update.message.reply_text(
+        f"Аккаунты-ориентиры для трендов ({len(current)}/{trends.MAX_ACCOUNTS}):\n{listing}\n\n"
+        "Добавить: /competitors @ник1 @ник2\nУбрать: /competitors удалить @ник\n"
+        "По ним бот ищет «залёты» — ролики, набравшие в 2+ раза больше обычного."
+    )
+
+
+async def run_trends(update: Update, hashtags: list[str] | None = None, topic: str = "", force: bool = False) -> None:
+    status = await update.effective_message.reply_text(
+        "📈 Собираю, что сейчас залетает в нише: хэштеги + аккаунты-ориентиры. Это займёт 1–3 минуты ⏳"
+    )
+    try:
+        result = await trends.collect(DATA_DIR, hashtags=hashtags, force=force)
+    except trends.TrendsError as e:
+        await status.edit_text(f"Не получилось собрать тренды: {e}")
+        return
+    except Exception:
+        logger.exception("Trends error")
+        await status.edit_text("Не получилось собрать тренды. Попробуй ещё раз через пару минут.")
+        return
+
+    try:
+        hint = "" if result["competitors"] else "\n💡 Добавь аккаунты-ориентиры (/competitors @ник) — тренды станут точнее."
+        await status.edit_text(
+            f"✅ Нашла {len(result['rows'])} свежих залетевших рилсов"
+            + (" (из кеша, обновить: /trends обнови)" if result.get("cached") else "")
+            + ". Придумываю хуки для Анны..." + hint
+        )
+    except BadRequest:
+        pass
+
+    summary = trends.trends_text(result)
+    content: list[dict] = [{"type": "text", "text": summary}]
+    for label, data_bytes, mime in await trends.covers(result):
+        content.append({"type": "text", "text": f"Обложка {label}"})
+        content.append(social.image_block(data_bytes, mime))
+    topic_line = f"\n\nЗапрос Анны: {topic}" if topic else ""
+    content.append({"type": "text", "text": TRENDS_PROMPT.format(topic=topic_line)})
+
+    note = summary[:7000] + "\n\n[Тренды ниши и хуки]" + (f" {topic}" if topic else "")
+    reply = await ask_claude(update, update.effective_chat.id, content, history_note=note, max_tokens=8000)
+    if reply:
+        m = MEMORY_RE.search(reply)
+        if m:
+            audit.save_audit(DATA_DIR, "__trends__", m.group(1).strip())
+
+
+# ---------------------------------------------------------------------------
 # Текст и ссылки
 # ---------------------------------------------------------------------------
 URL_RE = re.compile(r'https?://[^\s<>"\']+')
@@ -495,6 +589,9 @@ async def process_user_text(update: Update, user_text: str) -> None:
     urls = URL_RE.findall(user_text)[:MAX_LINKS_PER_MESSAGE]
 
     if not urls:
+        if TRENDS_INTENT_RE.search(user_text):
+            await run_trends(update, topic=user_text)
+            return
         if AUDIT_INTENT_RE.search(user_text):
             await run_audit(update, audit.CLIENT_INSTAGRAM, extra=user_text)
             return
@@ -1200,6 +1297,8 @@ def main() -> None:
     app.add_handler(CommandHandler("start", guarded(start)))
     app.add_handler(CommandHandler("new", guarded(new_dialog)))
     app.add_handler(CommandHandler("audit", guarded(audit_command)))
+    app.add_handler(CommandHandler(["trends", "hooks"], guarded(trends_command)))
+    app.add_handler(CommandHandler("competitors", guarded(competitors_command)))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, guarded(handle_video)))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE, guarded(handle_voice)))
     app.add_handler(MessageHandler(filters.PHOTO, guarded(handle_photo)))

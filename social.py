@@ -124,6 +124,7 @@ def _normalize_apify(item: dict, url: str) -> dict:
         "views": item.get("videoPlayCount") or item.get("videoViewCount"),
         "likes": item.get("likesCount"),
         "comments_count": item.get("commentsCount"),
+        "shares": item.get("sharesCount"),
         "duration": item.get("videoDuration"),
         "posted": item.get("timestamp"),
         "music": " — ".join(x for x in (music.get("artist_name"), music.get("song_name")) if x) or None,
@@ -370,7 +371,8 @@ def describe(result: dict) -> str:
         f"[Пост из {m['platform'].capitalize()}: {m['url']}]",
         f"Тип: {m.get('type')}",
         f"Автор: @{m.get('author')}" + (f" ({m['author_name']})" if m.get("author_name") else ""),
-        f"Просмотры: {_fmt_num(m.get('views'))} · Лайки: {_fmt_num(m.get('likes'))} · Комментарии: {_fmt_num(m.get('comments_count'))}",
+        f"Просмотры: {_fmt_num(m.get('views'))} · Лайки: {_fmt_num(m.get('likes'))} · Комментарии: {_fmt_num(m.get('comments_count'))}"
+        + (f" · Репосты: {_fmt_num(m['shares'])}" if m.get("shares") is not None else ""),
     ]
     if m.get("duration"):
         lines.append(f"Длительность: {float(m['duration']):.0f} сек")
