@@ -21,9 +21,10 @@ import cloudinary
 import cloudinary.uploader
 from openai import AsyncOpenAI
 
-from prompt import SYSTEM_PROMPT as ANNA_PROMPT, LINK_ANALYSIS_PROMPT, MONTAGE_PLAN_PROMPT
+from prompt import SYSTEM_PROMPT as ANNA_PROMPT, LINK_ANALYSIS_PROMPT, MONTAGE_PLAN_PROMPT, AUDIT_PROMPT
 import social
 import montage
+import audit
 
 logging.basicConfig(level=logging.INFO)
 # httpx пишет в лог каждый запрос к Telegram вместе с токеном бота в URL — глушим
@@ -122,6 +123,22 @@ def _sanitize_history(history: list[dict]) -> list[dict]:
     return clean
 
 
+MEMORY_RE = re.compile(r"<memory>(.*?)</memory>", re.DOTALL)
+
+
+def current_system_prompt() -> str:
+    """Промпт Анны + свежие факты из последнего аудита её аккаунта (если он был)."""
+    saved = audit.load_client_audit(DATA_DIR)
+    if not saved:
+        return SYSTEM_PROMPT
+    return (
+        SYSTEM_PROMPT
+        + f"\n\n=== ЖИВЫЕ ДАННЫЕ АККАУНТА @{audit.CLIENT_INSTAGRAM} (аудит ботом от {saved['date']}) ===\n"
+        + saved["summary"]
+        + "\nОпирайся на эти данные, когда советуешь темы, хуки и форматы. Они свежее, чем аудит выше.\n"
+    )
+
+
 conversations: dict[int, list[dict]] = {
     chat_id: _sanitize_history(h) for chat_id, h in _load_conversations().items()
 }
@@ -198,8 +215,9 @@ async def ask_claude(
     chat_id: int,
     content: str | list[dict],
     history_note: str | None = None,
-) -> None:
-    """Единая точка общения с Claude.
+    max_tokens: int | None = None,
+) -> str | None:
+    """Единая точка общения с Claude. Возвращает полный ответ (или None при ошибке).
 
     content — то, что видит модель сейчас (текст или текст + картинка/PDF).
     history_note — как это сообщение запомнить в истории (без тяжёлых вложений).
@@ -220,8 +238,8 @@ async def ask_claude(
         try:
             response = await client.messages.create(
                 model=CLAUDE_MODEL,
-                max_tokens=CLAUDE_MAX_TOKENS,
-                system=SYSTEM_PROMPT,
+                max_tokens=max_tokens or CLAUDE_MAX_TOKENS,
+                system=current_system_prompt(),
                 messages=messages,
             )
             reply_text = "".join(block.text for block in response.content if block.type == "text")
@@ -234,13 +252,16 @@ async def ask_claude(
             else:
                 msg = f"Ошибка при обращении к агенту ({e.status_code}). Попробуй ещё раз."
             await update.effective_message.reply_text(msg)
-            return
+            return None
         except Exception:
             logger.exception("Anthropic API error")
             await update.effective_message.reply_text("Не получилось получить ответ. Попробуй ещё раз.")
-            return
+            return None
         finally:
             typing_task.cancel()
+
+        full_reply = reply_text
+        reply_text = MEMORY_RE.sub("", reply_text).strip()  # служебный блок памяти пользователю не показываем
 
         if response.stop_reason == "max_tokens":
             reply_text += "\n\n_(ответ обрезан по длине — напиши «продолжи», и я допишу)_"
@@ -253,6 +274,7 @@ async def ask_claude(
         _save_conversations()
 
     await send_long(update, reply_text)
+    return full_reply
 
 
 async def _keep_typing(update: Update) -> None:
@@ -308,6 +330,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Что я умею:\n"
         "• Идеи, хуки и сценарии Reels в твоём голосе\n"
         "• Подписи к постам, разбор того, что заходит\n"
+        "• Анализирую твой Инстаграм и аккаунты конкурентов (кинь ссылку на профиль)\n"
         "• Отвечаю на любые вопросы — про контент, бизнес и просто жизнь\n"
         "• Понимаю голосовые и кружки 🎙\n"
         "• Разбираю рилсы и посты по ссылке (Instagram, TikTok, YouTube)\n"
@@ -315,6 +338,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Монтирую Reels: пришли видео — верну готовый ролик с субтитрами 🎬\n"
         "  (в подписи к видео можно написать пожелания, например «динамично»)\n\n"
         "Просто напиши или наговори, что нужно.\n"
+        "/audit — аудит твоего Инстаграма (или /audit @ник — любого аккаунта)\n"
         "/new — начать новый диалог (забыть контекст)"
     )
 
@@ -328,6 +352,77 @@ async def new_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Доступна всем, чтобы человек мог узнать свой ID для списка доступа.
     await update.message.reply_text(f"Твой Telegram ID: {update.effective_user.id}")
+
+
+# ---------------------------------------------------------------------------
+# Аудит аккаунта
+# ---------------------------------------------------------------------------
+AUDIT_INTENT_RE = re.compile(
+    r"(проанализ|анализ|аудит|разбе?р|разобрать|посмотри|оцени)\w*\s+(\w+\s+){0,3}(мой\s+|мою\s+|наш\w*\s+)?"
+    r"(аккаунт|акк|профил|инст|инстаграм|страниц|блог)",
+    re.I,
+)
+AUDIT_COOLDOWN: dict[str, float] = {}
+
+
+async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    arg = " ".join(context.args or []).strip()
+    handle = audit.normalize_handle(arg) if arg else audit.CLIENT_INSTAGRAM
+    if not handle:
+        await update.message.reply_text("Не поняла ник. Напиши так: /audit или /audit @nickname")
+        return
+    await run_audit(update, handle)
+
+
+async def run_audit(update: Update, handle: str, extra: str = "") -> None:
+    """Выгружает аккаунт, считает статистику и просит Claude сделать аудит."""
+    handle = handle.lstrip("@")
+    is_client = handle.lower() == audit.CLIENT_INSTAGRAM.lower()
+    status = await update.effective_message.reply_text(
+        f"🔎 Выгружаю @{handle}: последние {audit.AUDIT_POSTS} публикаций с цифрами. Это займёт 1–3 минуты ⏳"
+    )
+    try:
+        data = await audit.fetch_account(handle)
+        stats = audit.build_stats(data)
+    except audit.AuditError as e:
+        await status.edit_text(f"Не получилось проанализировать аккаунт: {e}")
+        return
+    except Exception:
+        logger.exception("Audit fetch error")
+        await status.edit_text("Не получилось выгрузить аккаунт. Попробуй ещё раз через пару минут.")
+        return
+
+    try:
+        await status.edit_text(
+            f"✅ Выгрузила @{handle}: {len(stats['rows'])} публикаций · подписчиков: {social._fmt_num(stats['followers'])}\n"
+            "Анализирую как продюсер..."
+        )
+    except BadRequest:
+        pass
+
+    summary = audit.stats_text(stats)
+    content: list[dict] = [{"type": "text", "text": summary}]
+    for label, data_bytes, mime in await audit.covers(stats):
+        content.append({"type": "text", "text": f"Обложка — {label}"})
+        content.append(social.image_block(data_bytes, mime))
+
+    who = "аккаунт Анны @" + handle if is_client else f"аккаунт @{handle} (конкурент/референс — что из этого взять Анне)"
+    hooks_for = "в голосе Анны, под её аудиторию" if is_client else "адаптированных под Анну и её позиционирование, а не копии"
+    task = AUDIT_PROMPT.format(who=who, hooks_for=hooks_for)
+    if extra and not AUDIT_INTENT_RE.fullmatch(extra):
+        task += f"\n\nДополнительный запрос: {extra}"
+    content.append({"type": "text", "text": task})
+
+    note = summary[:7000] + f"\n\n[Аудит аккаунта @{handle}]"
+    reply = await ask_claude(update, update.effective_chat.id, content, history_note=note, max_tokens=8000)
+    if reply and is_client:
+        m = MEMORY_RE.search(reply)
+        memory = m.group(1).strip() if m else ""
+        base_facts = (
+            f"Подписчиков: {social._fmt_num(stats['followers'])}; медиана просмотров рилсов: "
+            f"{social._fmt_num(stats['median_plays'])}; частота: ~{stats['per_week']} публикаций/нед."
+        )
+        audit.save_audit(DATA_DIR, handle, base_facts + "\n" + memory)
 
 
 # ---------------------------------------------------------------------------
@@ -400,7 +495,16 @@ async def process_user_text(update: Update, user_text: str) -> None:
     urls = URL_RE.findall(user_text)[:MAX_LINKS_PER_MESSAGE]
 
     if not urls:
+        if AUDIT_INTENT_RE.search(user_text):
+            await run_audit(update, audit.CLIENT_INSTAGRAM, extra=user_text)
+            return
         await ask_claude(update, chat_id, user_text)
+        return
+
+    # Ссылка на профиль Instagram — аудит аккаунта
+    profile = next((h for h in (audit.detect_profile(u) for u in urls) if h), None)
+    if profile:
+        await run_audit(update, profile, extra=URL_RE.sub("", user_text).strip())
         return
 
     # Ссылки на соцсети (Instagram / TikTok / YouTube) — отдельный разбор с видео и кадрами
@@ -763,7 +867,7 @@ async def make_montage_plan(transcript: str, wishes: str) -> montage.Plan:
         resp = await client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=2500,
-            system=SYSTEM_PROMPT,
+            system=current_system_prompt(),
             messages=[{"role": "user", "content": prompt}],
         )
         text = "".join(b.text for b in resp.content if b.type == "text")
@@ -1095,6 +1199,7 @@ def main() -> None:
     app.add_handler(CommandHandler("id", show_id))
     app.add_handler(CommandHandler("start", guarded(start)))
     app.add_handler(CommandHandler("new", guarded(new_dialog)))
+    app.add_handler(CommandHandler("audit", guarded(audit_command)))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, guarded(handle_video)))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE, guarded(handle_voice)))
     app.add_handler(MessageHandler(filters.PHOTO, guarded(handle_photo)))
