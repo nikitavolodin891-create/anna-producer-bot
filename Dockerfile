@@ -27,7 +27,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
  && apk del .build-deps
 
-COPY bot.py .
+COPY *.py ./
 COPY start.sh .
 RUN chmod +x start.sh
 

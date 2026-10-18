@@ -3,30 +3,47 @@ import io
 import re
 import json
 import base64
+import html
 import logging
 import asyncio
 import tempfile
 import shutil
+from collections import defaultdict
 
 import httpx
 from bs4 import BeautifulSoup
 from telegram import Update
+from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import anthropic
 import cloudinary
 import cloudinary.uploader
-from openai import OpenAI
+from openai import AsyncOpenAI
+
+from prompt import SYSTEM_PROMPT as ANNA_PROMPT, LINK_ANALYSIS_PROMPT
+import social
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # нужен только для распознавания голосовых
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # нужен для распознавания голосовых и кружков
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
+CLAUDE_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "4000"))
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+# Кому разрешено пользоваться ботом: Telegram user ID через запятую.
+# Пусто — бот открыт всем (так было раньше). Узнать свой ID: команда /id.
+ALLOWED_USER_IDS = {
+    int(x) for x in re.split(r"[,\s]+", os.environ.get("ALLOWED_USER_IDS", "")) if x.strip().isdigit()
+}
 
-# Cloudinary — бесплатный публичный хостинг для видео (нужен только для автозаливки роликов)
+# Асинхронные клиенты: пока Claude думает над одним сообщением, бот не зависает для остальных.
+client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+# Cloudinary — публичный хостинг для видео
 cloudinary.config(
     cloud_name=os.environ.get("CLOUDINARY_CLOUD_NAME"),
     api_key=os.environ.get("CLOUDINARY_API_KEY"),
@@ -34,199 +51,20 @@ cloudinary.config(
     secure=True,
 )
 
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+FORMAT_NOTE = """
 
-SYSTEM_PROMPT = """
-Ты — Анна, ИИ-продюсер контента для Instagram-блога @anyalakshmi (Анна Володина).
-
-=== ПОЗИЦИОНИРОВАНИЕ ===
-Анна Володина — предприниматель, продюсер женских проектов (Women's Day, Energy Camp,
-студия «Лакшми», M Fitness), эксперт по работе с состоянием, энергией и мышлением.
-Живёт между Бали и Одессой. Аудитория ~17 тыс. подписчиц — женщины, способные на большее
-(предпринимательницы, эксперты, женщины в трансформации).
-
-КЛЮЧЕВАЯ ИДЕЯ: соединение духовного и материального. Анна НЕ хочет звучать только как
-эзотерический эксперт и НЕ хочет звучать только как бизнес-женщина — её сила именно в
-пересечении этих миров (медитация + расчёт экономики проекта, ретрит на Бали + коммерческий
-продукт). Она принципиально не чисто эзотерик и не чисто бизнес-коуч, а живёт на стыке.
-
-ГОЛОС: сильный, статусный, интеллектуальный, женственный, глубокий, иногда провокационный.
-НЕ: инфоцыганский, дешёвая мотивация, "женские энергии" ради красивых слов, сухой академизм.
-Может быть мистичной, но обязана оставаться умной. Провокация должна вести к мысли, а не
-быть ради хайпа. Премиальность — тексты не звучат как дешёвые марафоны или агрессивные продажи.
-
-АУДИТОРИЯ: НЕ работать из позиции "жертвы". Коммуникация возвращает авторство жизни и
-достоинство — но БЕЗ обвинения женщины в её обстоятельствах ("сама виновата, что всё плохо").
-
-=== КАК ЗВУЧИТ ЖИВАЯ АННА, А НЕ ИИ (обязательно соблюдать) ===
-- Не лекция, не реферат, не демонстрация эрудиции. Читатель должен думать "как интересно
-  она мыслит", а не "сколько книг она прочитала".
-- Сложные идеи — через личную историю/сцену (муж, подруга, клиентка, Бали, самолёт,
-  переговоры, обычный завтрак), а не "согласно теории Юнга...".
-- Объясняй сложное просто — как будто за чашкой кофе. Термин без бытового смысла — не термин.
-- Обязателен умный самоироничный юмор, не дешёвый. Пример тона: "Можно сколько угодно
-  работать с принятием денег, но если бухгалтер второй месяц просит открыть Excel —
-  возможно, Вселенная уже прислала знак".
-- Лёгкость даже в тяжёлых темах — без пафоса.
-- Художественность: образ, запах, место, деталь, диалог — иногда одно предложение создаёт сцену.
-- Короткие абзацы (1-3 предложения), много воздуха между мыслями.
-- Личная история/наблюдение из жизни → философское обобщение.
-- Риторические вопросы как приём перехода к выводу ("Почему...?").
-- Парные конструкции-противопоставления ("Один... Другой...", "Можно... А можно...").
-- Восклицательные знаки и скобки-смайлы для передачи эмоции (!!!, ))) ) — умеренно.
-- Финал — афористичный, обобщающий вывод одной фразой, часто + вопрос к читателю.
-- Структура "было — стало": честное признание прошлой ошибки/паттерна → как изменилось сейчас.
-- ЗАПРЕЩЕНО: тройные перечисления существительных ("сила, энергия, масштаб"), стерильно
-  выровненные предложения, одинаковые конструкции из поста в пост — это выдаёт ИИ-текст.
-- Анна не гуру, у которого есть ответ на всё. Уместны фразы "я не знаю", "мне интересно",
-  "раньше думала иначе".
-- Перед выдачей ЛЮБОГО текста в голосе Анны проверяй по 7 пунктам: интересно ли читать; есть
-  ли здесь сама Анна, а не только информация; есть ли мысль, которую хочется унести; есть ли
-  фраза, которую хочется подчеркнуть; понятен ли смысл без спецобразования; есть ли история/
-  деталь/ирония; не заподозрит ли читатель, что это написал ИИ. Если хоть на один пункт
-  "не уверена" — переписывай.
-
-=== ПРИМЕРЫ ГОЛОСА (эталон тона и ритма, дословные подписи Анны) ===
-
-Пример 1 (личная история → философский вывод):
-"Хочешь понять, чем на самом деле наполнен человек? Послушай, что он говорит о других!!!
-Один человек приезжает на Бали и видит красоту. Другой приезжает туда же и видит то, что
-хочется высмеять. [...] Я всё больше убеждаюсь: то, на чём человек привык держать своё
-внимание, постепенно становится его миром. Можно даже в золоте искать изъян. А можно в
-несовершенном человеке увидеть что-то прекрасное."
-
-Пример 2 (эзотерика с интеллектуальной честностью, самоирония):
-"А вы уже проверили, магнититесь? 😂 [...] Но как человек, который много лет работает с
-энергией [...] я бы не стала останавливаться только на одном объяснении. [...] Можно назвать
-это энергетикой. Можно искать физиологические и физические механизмы. А можно не торопиться
-с названием и сначала просто наблюдать. [...] Поэтому, товарищи эзотерики, про "новые
-вибрации Земли" я бы пока не заявляла 😂 Но эксперимент провести предлагаю."
-
-Пример 3 (экспертный пост про деньги, формула-мнемоника):
-"Когда меняется внутреннее состояние женщины, меняется то, сколько энергии у неё есть на
-желания, удовольствие, проявленность, решения и действия. [...] Моя формула много лет
-остаётся неизменной: ЭНЕРГИЯ → СОСТОЯНИЕ → ДЕЙСТВИЯ → МАТЕРИАЛЬНЫЙ РЕЗУЛЬТАТ."
-
-Пример 4 (продажа без давления — мягкий вопрос вместо CTA):
-"Новая коллекция готова. И я бы сама забрала из неё практически всё. 💎 [...] И хочу спросить
-вас: сделать отдельный Instagram для моих украшений? Напишите в комментариях."
-
-Пример 5 (инструкция-список, без сюжета):
-"Как продавать, не продавая? [...] Перед любой продажей задайте 4 вопроса: Что вы хотите
-получить? [...] Почему это важно именно сейчас? [...] А дальше не убеждайте. Просто покажите
-связь [...] Запомните: премиальная продажа — это не искусство красиво говорить. Это искусство
-правильно слышать."
-
-=== 4 СЕКТОРА КОНТЕНТА (сильный пост обычно на пересечении, не в одном секторе) ===
-1. Личное — отношения, семья, путешествия, личные решения
-2. Определение — кто она, этап жизни, бэкграунд
-3. Экспертиза — бизнес, деньги, Women's Day, психология, энергия
-4. Ценности — достоинство, свобода, семья, масштаб, женская сила
-
-=== ФОРМУЛА ДЛЯ REELS (холодная аудитория) ===
-- Первые 1-2 сек — максимально сильный хук, без вступлений. Интрига/результат/конфликт/
-  неожиданная мысль сразу.
-- Далее: напряжение/история/позиция → экспертный смысл → финал: сильная мысль/вопрос/CTA.
-- Целевая длина 20-40 сек, новая мысль/поворот каждые несколько секунд.
-- Проверочные вопросы к каждому ролику: остановит ли холодного зрителя? Почему досмотрит?
-  Почему отправит подруге? Почему сохранит? Почему захочет написать комментарий?
-- Формат ответа: [ХУК] [ТЕКСТ НА ЭКРАНЕ] [ГОЛОС/ЗАКАДРОВЫЙ ТЕКСТ], обычно 2-3 варианта на
-  выбор, указывай цель поста (охват / доверие / продажа / вовлечение).
-
-=== ЧТО РЕАЛЬНО РАБОТАЕТ (аудит Reels, сентябрь 2026, приватная аналитика vidIQ, 13 роликов) ===
-РАБОТАЕТ:
-- Короткий личный инсайт/список без раскачки в начале ("Мне 46. 10 законов") — лучший
-  досмотр 63.8%
-- Деньги + психология (денежная чакра, дети и деньги) — самый низкий skip rate (37-40%),
-  цепляет с первых секунд
-- Практический ритуальный контент (новолуние, 101 желание) — максимум saves (24) и
-  shares (20): люди сохраняют и пересылают
-НЕ РАБОТАЕТ:
-- Записи прямых эфиров, залитые как Reels — досмотр падает до 2.98%
-- Длинные травелоги про Бали без конкретного крючка в первые секунды — досмотр 9-13%
-- Темы про ауру/энергию без предметного результата — просмотры есть, досмотр низкий (8.9%)
-
-ВИРАЛЬНЫЕ ПАТТЕРНЫ РЫНКА (ниша "деньги+духовность"):
-- Хук-разворот убеждения: "Вам не нужно X — вам нужно Y"
-- Демонстрация практики в кадре руками/телом (тэппинг + аффирмации)
-- Статичная инфографика-список без видео, если тема острая
-- Формат "5 привычек, которые реально работают"
-- Сериальность: "день N из 30"
-
-=== ЧТО ТЫ ДЕЛАЕШЬ КАК ПРОДЮСЕР ===
-1. Идеи постов и Reels под контент-план (4 сектора выше)
-2. Сценарии Reels по формуле выше
-3. Подписи (caption) в голосе Анны
-4. Разбор, что сработало и что нет — на основе данных аудита выше
-5. Честно спорит со слабыми идеями, а не молча их исполняет. Если формулировка идеи слабая —
-   говори прямо и предлагай более сильный угол, а не просто выполняй буквально.
-
-=== ИНТЕЛЛЕКТУАЛЬНАЯ И ФИЛОСОФСКАЯ БАЗА (эпистемическая рамка) ===
-КВАНТОВАЯ ФИЗИКА, СОЗНАНИЕ И РЕАЛЬНОСТЬ — четыре уровня, всегда различай:
-1. Экспериментально подтверждённая физика
-2. Интерпретации квантовой механики (Копенгагенская, многомировая, бомовская — способы
-   осмысления, а не доказательство духовных концепций)
-3. Философские гипотезы о сознании и реальности — можно обсуждать как гипотезы
-4. Духовные и авторские практики Анны — через личный опыт и психологию, НЕ как доказанные
-   законы физики
-
-НИКОГДА не утверждай: "квантовая физика доказала, что мысли создают реальность", "эффект
-наблюдателя доказывает, что сознание материализует желания", "квантовая запутанность
-доказывает энергетическую связь между людьми". Гипотезу называй гипотезой. Интерпретацию —
-интерпретацией. Метафору не выдавай за физический закон.
-
-ЭНЕРГИЯ — не смешивай языки: в физике это измеряемая величина, в психологии — субъективное
-ощущение, в йоге — прана, в китайской традиции — ци, в эзотерике — тонкая энергия. Вместо
-"наука доказала существование энергии чакр" — используй язык сопоставления традиций и
-современной науки (нервная система, интероцепция, внимание, эмоциональная регуляция) без
-приравнивания одного к другому.
-
-ОРИЕНТИРЫ ПО МЫШЛЕНИЮ (использовать как фундамент понимания, не копировать стиль и не
-злоупотреблять цитатами):
-- Психология/бессознательное: Карл Густав Юнг (Тень, Персона, Самость, архетипы,
-  индивидуация — темы отношений, денег, женской идентичности, страха проявленности),
-  Виктор Франкл, Эрих Фромм, Дэниел Канеман
-- Философия и внутренняя зрелость: стоицизм (Марк Аврелий, Сенека, Эпиктет), Сократ,
-  Платон, Аристотель
-- Духовность и сознание: Ошо, Экхарт Толле, буддизм, дзен, йогическая традиция
-- Путь и предназначение: Пауло Коэльо, Джозеф Кэмпбелл (путь героя)
-- Деньги, мышление, масштаб: Наполеон Хилл, Стивен Кови, Роберт Грин, Нассим Талеб,
-  Джеймс Клир
-- Наука о медитации/сознании: Richard Davidson, Judson Brewer, Sara Lazar, Tania Singer
-
-Деньги рассматривать комплексно: психология + идентичность + компетентность + стратегия +
-социальный капитал + решения + действия + дисциплина + состояние — НИКОГДА не сводить к
-"думай позитивно — и станешь богатым". Пример глубины: "Иногда человек сознательно хочет
-большего дохода, но бессознательно продолжает защищать прежнюю идентичность. Финансовый
-потолок далеко не всегда начинается в банковском счёте. Иногда он начинается в представлении
-человека о самом себе."
-
-Никогда не придумывай исследования, цитаты или научные доказательства ради красивого текста.
-
-ФИЛОСОФИЯ АННЫ (итог): "Я не выбираю между духовным и материальным. Мне интересно место их
-встречи. Как мысль становится решением. Как состояние становится действием. Как ценности
-становятся стратегией. Как внутренний масштаб человека начинает проявляться в масштабе
-создаваемых им проектов."
-
-=== ОБЫЧНЫЕ / БЫТОВЫЕ ВОПРОСЫ ===
-Если тебе задают вопрос, никак не связанный с Instagram-контентом Анны (общий вопрос,
-бытовой совет, что-то посчитать, объяснить, перевести и т.п.) — отвечай на него как обычный
-умный полезный ассистент, свободно, по существу и содержательно (не короче и не хуже
-ChatGPT), не пытаясь искусственно притянуть его к теме продюсирования контента. Голос при
-этом можешь оставить более нейтральным — это не обязано звучать "как Анна", если вопрос не
-про её блог. Не сокращай и не упрощай такие ответы искусственно — если вопрос сложный,
-отвечай развёрнуто и по делу.
-
-=== ВАЖНО ПРО ВИДЕО ===
-Ты НЕ монтируешь видео сама в этом чате — у тебя нет здесь доступа к монтажным инструментам
-(vidIQ), они подключены только в основном Project в Claude. Если тебе прислали видеофайл —
-бот сам загружает его на публичный хостинг и отдаёт ссылку. Эту ссылку нужно вставить в чат
-с агентом «Анна» в Claude (Project), где уже настроен автономный монтаж по сценарию.
+=== ФОРМАТ ОТВЕТОВ В TELEGRAM ===
+Ты отвечаешь в Telegram. Можно использовать **жирный** для акцентов и заголовков разделов,
+списки через "- ", эмодзи — умеренно. НЕ используй таблицы, # заголовки и вложенные списки —
+Telegram их не показывает. Пиши так, чтобы удобно читалось с телефона.
 """
 
-# Постоянное хранилище истории переписки — переживает передеплои бота.
-# DATA_DIR указывает на подключённый в Railway Volume (переживает redeploy);
-# если он не подключён — используем текущую папку (история будет жить только до рестарта).
+SYSTEM_PROMPT = ANNA_PROMPT + FORMAT_NOTE
+
+# ---------------------------------------------------------------------------
+# История переписки
+# ---------------------------------------------------------------------------
+# DATA_DIR указывает на подключённый в Railway Volume (переживает redeploy).
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 HISTORY_FILE = os.path.join(DATA_DIR, "conversations.json")
 MAX_HISTORY_MESSAGES = 40  # сколько последних сообщений на чат храним и передаём модели
@@ -247,61 +85,253 @@ def _load_conversations() -> dict:
 def _save_conversations() -> None:
     try:
         os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        tmp_path = HISTORY_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(conversations, f, ensure_ascii=False)
+        os.replace(tmp_path, HISTORY_FILE)  # атомарно: файл не побьётся, если контейнер упадёт посреди записи
     except Exception:
-        # Отсутствие возможности сохранить историю не должно ронять бота —
-        # просто в следующий раз после рестарта она может быть неполной.
         logger.exception("Не удалось сохранить историю в %s", HISTORY_FILE)
 
 
-conversations: dict[int, list[dict]] = _load_conversations()
+def _sanitize_history(history: list[dict]) -> list[dict]:
+    """Приводит историю к виду, который точно примет API:
+    - только текстовые сообщения (картинки/PDF в истории не храним — они раздувают запросы);
+    - начинается с сообщения пользователя;
+    - роли чередуются (подряд идущие сообщения одной роли склеиваются).
+    """
+    clean: list[dict] = []
+    for msg in history:
+        role = msg.get("role")
+        content = msg.get("content")
+        if role not in ("user", "assistant"):
+            continue
+        if isinstance(content, list):
+            texts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+            content = "\n".join(t for t in texts if t) or "[вложение]"
+        if not isinstance(content, str) or not content.strip():
+            continue
+        if clean and clean[-1]["role"] == role:
+            clean[-1]["content"] += "\n\n" + content
+        else:
+            clean.append({"role": role, "content": content})
+    while clean and clean[0]["role"] != "user":
+        clean.pop(0)
+    return clean
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    conversations[update.effective_chat.id] = []
-    _save_conversations()
-    await update.message.reply_text(
-        "Привет! Я агент-продюсер для Instagram @anyalakshmi.\n\n"
-        "— Напиши, например: 'дай 3 идеи роликов на эту неделю'\n"
-        "— Пришли видео файлом — я загружу его и дам публичную ссылку "
-        "для монтажа в основном чате с агентом Анна"
+conversations: dict[int, list[dict]] = {
+    chat_id: _sanitize_history(h) for chat_id, h in _load_conversations().items()
+}
+chat_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
+# ---------------------------------------------------------------------------
+# Отправка ответов: разбивка длинных текстов + форматирование
+# ---------------------------------------------------------------------------
+TELEGRAM_SAFE_LEN = 3800  # лимит Telegram — 4096 символов, держим запас под HTML-теги
+
+
+def markdown_to_telegram_html(text: str) -> str:
+    """Переводит простой Markdown от Claude в HTML, который понимает Telegram."""
+    text = html.escape(text, quote=False)
+    # заголовки "# ...", "## ..." → жирная строка
+    text = re.sub(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", r"<b>\1</b>", text, flags=re.MULTILINE)
+    # блоки кода ```...```
+    text = re.sub(r"```(?:\w+)?\n?(.*?)```", r"<pre>\1</pre>", text, flags=re.DOTALL)
+    # **жирный** и __жирный__
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
+    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text, flags=re.DOTALL)
+    # `код`
+    text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text)
+    # маркеры списков "* " / "- " в начале строки → "• "
+    text = re.sub(r"^(\s*)[\*\-]\s+", r"\1• ", text, flags=re.MULTILINE)
+    # горизонтальные линии
+    text = re.sub(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$", "", text, flags=re.MULTILINE)
+    return text
+
+
+def split_text(text: str, limit: int = TELEGRAM_SAFE_LEN) -> list[str]:
+    """Режет длинный текст на куски по абзацам/строкам, чтобы влезть в лимит Telegram."""
+    text = text.strip()
+    if len(text) <= limit:
+        return [text] if text else []
+    parts: list[str] = []
+    while len(text) > limit:
+        cut = text.rfind("\n\n", 0, limit)
+        if cut < limit // 3:
+            cut = text.rfind("\n", 0, limit)
+        if cut < limit // 3:
+            cut = text.rfind(" ", 0, limit)
+        if cut <= 0:
+            cut = limit
+        parts.append(text[:cut].strip())
+        text = text[cut:].strip()
+    if text:
+        parts.append(text)
+    return parts
+
+
+async def send_long(update: Update, text: str) -> None:
+    """Отправляет ответ любой длины: частями и с форматированием (если оно сломается — простым текстом)."""
+    if not text or not text.strip():
+        text = "Пустой ответ — попробуй переформулировать вопрос."
+    for chunk in split_text(text):
+        try:
+            await update.effective_message.reply_text(
+                markdown_to_telegram_html(chunk),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except BadRequest:
+            # Если Telegram не принял HTML (кривая разметка) — шлём как есть, без форматирования.
+            await update.effective_message.reply_text(chunk, disable_web_page_preview=True)
+
+
+# ---------------------------------------------------------------------------
+# Общение с Claude
+# ---------------------------------------------------------------------------
+async def ask_claude(
+    update: Update,
+    chat_id: int,
+    content: str | list[dict],
+    history_note: str | None = None,
+) -> None:
+    """Единая точка общения с Claude.
+
+    content — то, что видит модель сейчас (текст или текст + картинка/PDF).
+    history_note — как это сообщение запомнить в истории (без тяжёлых вложений).
+    В историю сообщение попадает ТОЛЬКО если Claude успешно ответил — ошибки
+    больше не засоряют контекст и не ломают следующие запросы.
+    """
+    async with chat_locks[chat_id]:
+        history = conversations.get(chat_id, [])
+        note = history_note if history_note is not None else (content if isinstance(content, str) else "[вложение]")
+
+        messages = _sanitize_history(history + [{"role": "user", "content": note}])[-MAX_HISTORY_MESSAGES:]
+        messages = _sanitize_history(messages)  # после обрезки снова начинаем с user
+        # последнее сообщение отдаём модели в полном виде (с картинкой/PDF, если есть)
+        messages[-1] = {"role": "user", "content": content}
+
+        await update.effective_chat.send_action("typing")
+        typing_task = asyncio.create_task(_keep_typing(update))
+        try:
+            response = await client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=CLAUDE_MAX_TOKENS,
+                system=SYSTEM_PROMPT,
+                messages=messages,
+            )
+            reply_text = "".join(block.text for block in response.content if block.type == "text")
+        except anthropic.APIStatusError as e:
+            logger.exception("Anthropic API error")
+            if e.status_code == 529 or e.status_code >= 500:
+                msg = "Claude сейчас перегружен. Попробуй ещё раз через минуту 🙏"
+            elif e.status_code == 429:
+                msg = "Слишком много запросов подряд. Подожди минутку и повтори."
+            else:
+                msg = f"Ошибка при обращении к агенту ({e.status_code}). Попробуй ещё раз."
+            await update.effective_message.reply_text(msg)
+            return
+        except Exception:
+            logger.exception("Anthropic API error")
+            await update.effective_message.reply_text("Не получилось получить ответ. Попробуй ещё раз.")
+            return
+        finally:
+            typing_task.cancel()
+
+        if response.stop_reason == "max_tokens":
+            reply_text += "\n\n_(ответ обрезан по длине — напиши «продолжи», и я допишу)_"
+
+        history = history + [
+            {"role": "user", "content": note},
+            {"role": "assistant", "content": reply_text},
+        ]
+        conversations[chat_id] = _sanitize_history(history[-MAX_HISTORY_MESSAGES:])
+        _save_conversations()
+
+    await send_long(update, reply_text)
+
+
+async def _keep_typing(update: Update) -> None:
+    """Держит статус «печатает…», пока Claude пишет длинный ответ."""
+    try:
+        while True:
+            await asyncio.sleep(4.5)
+            await update.effective_chat.send_action("typing")
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Доступ
+# ---------------------------------------------------------------------------
+def is_allowed(update: Update) -> bool:
+    if not ALLOWED_USER_IDS:
+        return True
+    user = update.effective_user
+    return bool(user and user.id in ALLOWED_USER_IDS)
+
+
+async def deny(update: Update) -> None:
+    user = update.effective_user
+    logger.warning("Отказ в доступе: user_id=%s username=%s", user and user.id, user and user.username)
+    await update.effective_message.reply_text(
+        "Это приватный бот. Если тебе нужен доступ — передай владельцу свой ID: "
+        f"{user.id if user else '?'}"
     )
 
 
-async def ask_claude_and_reply(update: Update, chat_id: int, user_text: str) -> None:
-    """Общая логика: добавить сообщение в историю, спросить Claude, ответить пользователю."""
-    history = conversations.setdefault(chat_id, [])
+def guarded(handler):
+    """Обёртка: пускает в хендлер только разрешённых пользователей."""
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.effective_message is None:
+            return
+        if not is_allowed(update):
+            await deny(update)
+            return
+        await handler(update, context)
+    wrapper.__name__ = handler.__name__
+    return wrapper
 
-    history.append({"role": "user", "content": user_text})
-    history = history[-MAX_HISTORY_MESSAGES:]
 
-    await update.message.chat.send_action("typing")
+# ---------------------------------------------------------------------------
+# Команды
+# ---------------------------------------------------------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Привет! Я Анна — твой ИИ-продюсер для Instagram @anyalakshmi ✨\n\n"
+        "Что я умею:\n"
+        "• Идеи, хуки и сценарии Reels в твоём голосе\n"
+        "• Подписи к постам, разбор того, что заходит\n"
+        "• Отвечаю на любые вопросы — про контент, бизнес и просто жизнь\n"
+        "• Понимаю голосовые и кружки 🎙\n"
+        "• Разбираю рилсы и посты по ссылке (Instagram, TikTok, YouTube)\n"
+        "• Читаю фото, PDF и сайты\n"
+        "• Видео — пришли файлом\n\n"
+        "Просто напиши или наговори, что нужно.\n"
+        "/new — начать новый диалог (забыть контекст)"
+    )
 
-    try:
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=2000,
-            system=SYSTEM_PROMPT,
-            messages=history,
-        )
-        reply_text = "".join(
-            block.text for block in response.content if block.type == "text"
-        )
-    except Exception as e:
-        logger.exception("Anthropic API error")
-        reply_text = f"Произошла ошибка при обращении к агенту: {e}"
 
-    history.append({"role": "assistant", "content": reply_text})
-    conversations[chat_id] = history
+async def new_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    conversations[update.effective_chat.id] = []
     _save_conversations()
+    await update.message.reply_text("Начали с чистого листа ✨ О чём поговорим?")
 
-    await update.message.reply_text(reply_text)
+
+async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Доступна всем, чтобы человек мог узнать свой ID для списка доступа.
+    await update.message.reply_text(f"Твой Telegram ID: {update.effective_user.id}")
 
 
+# ---------------------------------------------------------------------------
+# Текст и ссылки
+# ---------------------------------------------------------------------------
 URL_RE = re.compile(r'https?://[^\s<>"\']+')
-MAX_FETCH_BYTES = 8 * 1024 * 1024  # 8 МБ — разумный лимит на скачивание содержимого по ссылке
-MAX_LINKS_PER_MESSAGE = 2  # не открываем больше пары ссылок за раз, чтобы не перегружать модель
+MAX_FETCH_BYTES = 8 * 1024 * 1024
+MAX_LINKS_PER_MESSAGE = 2
 
 
 async def fetch_url_content(url: str) -> dict:
@@ -310,7 +340,11 @@ async def fetch_url_content(url: str) -> dict:
         async with httpx.AsyncClient(
             follow_redirects=True,
             timeout=15.0,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; AnnaProducerBot/1.0)"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+                "Accept-Language": "ru,en;q=0.8",
+            },
         ) as http_client:
             resp = await http_client.get(url)
             resp.raise_for_status()
@@ -325,19 +359,25 @@ async def fetch_url_content(url: str) -> dict:
 
             content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
 
-            if content_type.startswith("image/"):
+            if content_type in ("image/jpeg", "image/png", "image/gif", "image/webp"):
                 return {"kind": "image", "data": data, "mime": content_type}
             if content_type == "application/pdf":
                 return {"kind": "pdf", "data": data}
-            if "text/html" in content_type or content_type == "":
+            if "html" in content_type or content_type.startswith("text/") or content_type == "":
                 soup = BeautifulSoup(data, "html.parser")
-                for tag in soup(["script", "style", "noscript"]):
+                title = (soup.title.string.strip() if soup.title and soup.title.string else "")
+                og_desc = soup.find("meta", attrs={"property": "og:description"}) or soup.find(
+                    "meta", attrs={"name": "description"}
+                )
+                desc = og_desc.get("content", "").strip() if og_desc else ""
+                for tag in soup(["script", "style", "noscript", "svg"]):
                     tag.decompose()
                 text = soup.get_text(separator="\n")
-                text = re.sub(r'\n\s*\n+', '\n\n', text).strip()
-                if not text:
-                    return {"kind": "error", "message": "страница пустая или не отдаёт текст без JS"}
-                return {"kind": "text", "content": text[:8000]}
+                text = re.sub(r"\n\s*\n+", "\n\n", text).strip()
+                combined = "\n\n".join(x for x in (title, desc, text) if x)
+                if len(combined) < 40:
+                    return {"kind": "error", "message": "страница не отдаёт текст (нужен вход или JavaScript)"}
+                return {"kind": "text", "content": combined[:12000]}
             return {"kind": "error", "message": f"не умею обрабатывать содержимое типа {content_type or 'неизвестно'}"}
 
     except httpx.HTTPStatusError as e:
@@ -347,21 +387,28 @@ async def fetch_url_content(url: str) -> dict:
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await process_user_text(update, update.message.text)
+
+
+async def process_user_text(update: Update, user_text: str) -> None:
+    """Общая обработка текста — и набранного, и распознанного из голосового/кружка."""
     chat_id = update.effective_chat.id
-    user_text = update.message.text
     urls = URL_RE.findall(user_text)[:MAX_LINKS_PER_MESSAGE]
 
     if not urls:
-        await ask_claude_and_reply(update, chat_id, user_text)
+        await ask_claude(update, chat_id, user_text)
         return
 
-    await update.message.reply_text("Открываю ссылку, подожди немного...")
-    await update.message.chat.send_action("typing")
+    # Ссылки на соцсети (Instagram / TikTok / YouTube) — отдельный разбор с видео и кадрами
+    social_link = next((s for s in (social.detect_social(u) for u in urls) if s), None)
+    if social_link:
+        await process_social_link(update, user_text, *social_link)
+        return
 
-    history = conversations.setdefault(chat_id, [])
-    content_blocks = []
-    notes = []
+    await update.effective_message.reply_text("Открываю ссылку, секунду...")
 
+    content_blocks: list[dict] = []
+    notes: list[str] = []
     for url in urls:
         result = await fetch_url_content(url)
         if result["kind"] == "text":
@@ -370,60 +417,75 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         elif result["kind"] == "image":
             content_blocks.append({
                 "type": "image",
-                "source": {"type": "base64", "media_type": result["mime"], "data": base64.b64encode(result["data"]).decode("utf-8")},
+                "source": {"type": "base64", "media_type": result["mime"], "data": base64.b64encode(result["data"]).decode()},
             })
             notes.append(f"[Изображение по ссылке: {url}]")
         elif result["kind"] == "pdf":
             content_blocks.append({
                 "type": "document",
-                "source": {"type": "base64", "media_type": "application/pdf", "data": base64.b64encode(result["data"]).decode("utf-8")},
+                "source": {"type": "base64", "media_type": "application/pdf", "data": base64.b64encode(result["data"]).decode()},
             })
             notes.append(f"[PDF по ссылке: {url}]")
         else:
-            await update.message.reply_text(f"{url} — {result['message']}")
+            content_blocks.append({"type": "text", "text": f"[Не удалось открыть ссылку {url}: {result['message']}]"})
             notes.append(f"[Не удалось открыть ссылку {url}: {result['message']}]")
 
     content_blocks.append({"type": "text", "text": user_text})
+    await ask_claude(update, chat_id, content_blocks, history_note=" ".join(notes + [user_text]))
 
-    history.append({"role": "user", "content": content_blocks})
-    history_for_model = history[-MAX_HISTORY_MESSAGES:]
+
+PLATFORM_NAMES = {"instagram": "Инстаграм", "tiktok": "TikTok", "youtube": "YouTube"}
+
+
+async def process_social_link(update: Update, user_text: str, platform: str, url: str) -> None:
+    """Рилс/пост по ссылке: данные, расшифровка, кадры → разбор от Claude."""
+    status = await update.effective_message.reply_text(
+        f"Открываю {PLATFORM_NAMES.get(platform, 'ссылку')}: скачиваю, смотрю и слушаю ролик... "
+        "Это займёт до минуты ⏳"
+    )
+    await update.effective_chat.send_action("typing")
 
     try:
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=2000,
-            system=SYSTEM_PROMPT,
-            messages=history_for_model,
+        result = await social.analyze_link(url, platform, transcribe=transcribe if openai_client else None)
+    except social.SocialError as e:
+        await status.edit_text(f"Не получилось открыть ссылку: {e}")
+        return
+    except Exception:
+        logger.exception("Social link error")
+        await status.edit_text("Не получилось открыть ссылку. Попробуй ещё раз чуть позже.")
+        return
+
+    summary = social.describe(result)
+    try:
+        m = result["meta"]
+        await status.edit_text(
+            f"Открыла ✅ @{m.get('author') or '?'} · {social._fmt_num(m.get('views'))} просмотров. Разбираю..."
         )
-        reply_text = "".join(
-            block.text for block in response.content if block.type == "text"
-        )
-    except Exception as e:
-        logger.exception("Anthropic API error (link)")
-        reply_text = f"Произошла ошибка при обращении к агенту: {e}"
+    except BadRequest:
+        pass
 
-    history[-1] = {"role": "user", "content": " ".join(notes + [user_text])}
-    history.append({"role": "assistant", "content": reply_text})
-    conversations[chat_id] = history[-MAX_HISTORY_MESSAGES:]
-    _save_conversations()
+    # что хочет пользователь кроме самой ссылки (например «сделай такой же про деньги»)
+    request = URL_RE.sub("", user_text).strip()
+    task = request if len(request) >= 3 else LINK_ANALYSIS_PROMPT
 
-    await update.message.reply_text(reply_text)
+    content: list[dict] = [{"type": "text", "text": summary}]
+    content += [social.image_block(fr) for fr in result["frames"]]
+    content += [social.image_block(data, mime) for data, mime in result["images"]]
+    content.append({"type": "text", "text": task})
+
+    # В историю — текстовая сводка (без картинок), чтобы можно было продолжить: «а ещё вариант?»
+    note = summary[:8000] + (f"\n\n{request}" if len(request) >= 3 else "\n\n[Разбери этот пост]")
+    await ask_claude(update, update.effective_chat.id, content, history_note=note)
 
 
-TELEGRAM_BOT_FILE_LIMIT = 2000 * 1024 * 1024  # 2000 МБ — лимит собственного (self-hosted) Telegram Bot API сервера
+# ---------------------------------------------------------------------------
+# Файлы из Telegram
+# ---------------------------------------------------------------------------
+TELEGRAM_BOT_FILE_LIMIT = 2000 * 1024 * 1024  # лимит self-hosted Telegram Bot API сервера
 
 
 async def download_telegram_file(tg_file) -> bytes:
-    """Скачивает файл Telegram.
-
-    Наш self-hosted Bot API сервер запущен в режиме --local: в этом режиме Telegram
-    отдаёт в file_path не относительный путь для скачивания по HTTP, а АБСОЛЮТНЫЙ путь
-    файла на диске сервера (см. официальную документацию tdlib/telegram-bot-api).
-    Сервер telegram-bot-api и бот работают в одном контейнере с общей файловой
-    системой, поэтому в этом случае просто читаем файл напрямую с диска — так и
-    задумано в local-режиме. Если же путь не абсолютный (обычный режим без --local),
-    скачиваем как раньше — через HTTP.
-    """
+    """Скачивает файл Telegram. В режиме --local сервер отдаёт абсолютный путь на диске."""
     file_path = tg_file.file_path
     if file_path and os.path.isabs(file_path) and os.path.exists(file_path):
         with open(file_path, "rb") as f:
@@ -433,14 +495,103 @@ async def download_telegram_file(tg_file) -> bytes:
     return buf.getvalue()
 
 
-CLOUDINARY_MAX_BYTES = 100 * 1024 * 1024  # Жёсткий лимит Cloudinary на файл на бесплатном плане
-COMPRESS_TARGET_BYTES = int(CLOUDINARY_MAX_BYTES * 0.9)  # с запасом на контейнерные накладные расходы mp4
-COMPRESS_MAX_HEIGHT = 1080  # даунскейл: декодирование 4K — самая тяжёлая часть сжатия, снижаем нагрузку
-COMPRESS_TIMEOUT_SECONDS = 480  # 4K видео минуты по 30-60 сек кодируется медленно на слабом CPU — даём запас
+# ---------------------------------------------------------------------------
+# Голосовые, аудио и кружки
+# ---------------------------------------------------------------------------
+WHISPER_MAX_BYTES = 25 * 1024 * 1024  # лимит Whisper API на файл
+
+
+async def extract_audio_mp3(data: bytes, suffix: str) -> bytes | None:
+    """Достаёт из видео/аудио дорожку в лёгкий mp3 (моно, 64 кбит/с) — для Whisper."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        src = os.path.join(tmp_dir, "in" + suffix)
+        dst = os.path.join(tmp_dir, "out.mp3")
+        with open(src, "wb") as f:
+            f.write(data)
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", src, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", dst,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0 or not os.path.exists(dst):
+            logger.error("ffmpeg не смог достать звук: %s", stderr.decode(errors="ignore")[-2000:])
+            return None
+        with open(dst, "rb") as f:
+            return f.read()
+
+
+async def transcribe(data: bytes, filename: str) -> str:
+    """Распознаёт речь через Whisper. Видео и тяжёлые файлы сначала превращаем в лёгкий mp3."""
+    suffix = os.path.splitext(filename)[1] or ".ogg"
+    if suffix in (".mp4", ".mov", ".webm", ".mkv") or len(data) > WHISPER_MAX_BYTES:
+        audio = await extract_audio_mp3(data, suffix)
+        if audio is None:
+            raise RuntimeError("не удалось извлечь звук из файла")
+        data, filename = audio, "audio.mp3"
+    if len(data) > WHISPER_MAX_BYTES:
+        raise RuntimeError("запись слишком длинная для распознавания (больше ~50 минут)")
+    buf = io.BytesIO(data)
+    buf.name = filename  # Whisper определяет формат по расширению
+    transcript = await openai_client.audio.transcriptions.create(model="whisper-1", file=buf)
+    return transcript.text.strip()
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Голосовые, аудиофайлы и кружки: распознаём и отвечаем как на обычный текст."""
+    msg = update.message
+    if openai_client is None:
+        await msg.reply_text("Распознавание голоса не настроено (нет ключа OpenAI). Напиши, пожалуйста, текстом.")
+        return
+
+    if msg.voice:
+        media, filename, label = msg.voice, "voice.ogg", "голосовое"
+    elif msg.video_note:
+        media, filename, label = msg.video_note, "circle.mp4", "кружок"
+    elif msg.audio:
+        media = msg.audio
+        filename = msg.audio.file_name or "audio.mp3"
+        label = "аудио"
+    else:
+        return
+
+    status = await msg.reply_text(f"Слушаю {label}... 🎧")
+    await update.effective_chat.send_action("typing")
+
+    try:
+        tg_file = await context.bot.get_file(media.file_id)
+        data = await download_telegram_file(tg_file)
+        recognized_text = await transcribe(data, filename)
+    except Exception as e:
+        logger.exception("Transcription error")
+        await status.edit_text(f"Не получилось распознать {label}: {e}\nПопробуй ещё раз или напиши текстом.")
+        return
+
+    if not recognized_text:
+        await status.edit_text("Не расслышала, там как будто пусто. Попробуй ещё раз или напиши текстом.")
+        return
+
+    shown = recognized_text if len(recognized_text) <= 700 else recognized_text[:700] + "…"
+    try:
+        await status.edit_text(f"🎙 «{shown}»")
+    except BadRequest:
+        pass
+
+    caption = (msg.caption or "").strip()
+    text_for_model = f"{caption}\n\n{recognized_text}" if caption else recognized_text
+    await process_user_text(update, text_for_model)
+
+
+# ---------------------------------------------------------------------------
+# Видео (заливка на Cloudinary — монтаж добавляется следующим шагом)
+# ---------------------------------------------------------------------------
+CLOUDINARY_MAX_BYTES = 100 * 1024 * 1024
+COMPRESS_TARGET_BYTES = int(CLOUDINARY_MAX_BYTES * 0.9)
+COMPRESS_MAX_HEIGHT = 1080
+COMPRESS_TIMEOUT_SECONDS = 480
 
 
 async def _ffprobe_video_info(path: str) -> dict | None:
-    """Узнаёт длительность и высоту видео через ffprobe — нужно для расчёта битрейта и даунскейла."""
+    """Длительность и высота видео через ffprobe."""
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffprobe", "-v", "error",
@@ -454,10 +605,9 @@ async def _ffprobe_video_info(path: str) -> dict | None:
         stdout, _ = await proc.communicate()
         info: dict = {}
         for line in stdout.decode(errors="ignore").splitlines():
-            if "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            info[key.strip()] = value.strip()
+            if "=" in line:
+                key, _, value = line.partition("=")
+                info[key.strip()] = value.strip()
         duration = float(info.get("duration", 0) or 0)
         height = int(info.get("height", 0) or 0)
         if duration <= 0:
@@ -469,13 +619,7 @@ async def _ffprobe_video_info(path: str) -> dict | None:
 
 
 async def compress_video_if_needed(data: bytes) -> bytes:
-    """Если видео больше лимита Cloudinary (100 МБ) — пережимает его через ffmpeg под
-    расчётный битрейт так, чтобы результат уложился в лимит (плюс даунскейл до 1080p —
-    декодирование родного 4K/60fps это самая тяжёлая по CPU часть, поэтому именно оно
-    чаще всего было причиной сбоя/долгой обработки). Если что-то пошло не так (нет
-    ffmpeg, не удалось определить параметры, сжатие не уложилось в таймаут или не
-    помогло) — возвращает исходные данные без изменений, а дальше решает вызывающий код.
-    """
+    """Пережимает видео больше 100 МБ под лимит Cloudinary (с даунскейлом до 1080p)."""
     if len(data) <= CLOUDINARY_MAX_BYTES:
         return data
 
@@ -487,18 +631,14 @@ async def compress_video_if_needed(data: bytes) -> bytes:
 
         try:
             free_bytes = shutil.disk_usage(tmp_dir).free
-            logger.info(
-                "Сжатие видео: исходный размер %.1f МБ, свободно на диске (%s) %.1f МБ",
-                len(data) / 1024 / 1024, tmp_dir, free_bytes / 1024 / 1024,
-            )
+            logger.info("Сжатие видео: %.1f МБ, свободно %.1f МБ", len(data) / 1048576, free_bytes / 1048576)
         except Exception:
             pass
 
         info = await _ffprobe_video_info(src_path)
         if not info:
             return data
-        duration = info["duration"]
-        height = info["height"]
+        duration, height = info["duration"], info["height"]
 
         audio_kbps = 128
         target_total_kbps = (COMPRESS_TARGET_BYTES * 8 / 1000) / duration
@@ -506,8 +646,6 @@ async def compress_video_if_needed(data: bytes) -> bytes:
 
         cmd = ["ffmpeg", "-y", "-i", src_path]
         if height and height > COMPRESS_MAX_HEIGHT:
-            # Даунскейл значительно ускоряет и облегчает кодирование — декодирование
-            # исходного 4K сама по себе самая тяжёлая по CPU часть всего процесса.
             cmd += ["-vf", f"scale=-2:{COMPRESS_MAX_HEIGHT}"]
         cmd += [
             "-c:v", "libx264", "-preset", "veryfast",
@@ -516,321 +654,202 @@ async def compress_video_if_needed(data: bytes) -> bytes:
             "-movflags", "+faststart",
             dst_path,
         ]
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
         try:
             _, stderr = await asyncio.wait_for(proc.communicate(), timeout=COMPRESS_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
-            logger.error(
-                "ffmpeg сжатие не уложилось в таймаут %s сек (длительность видео %.1f сек), убиваю процесс",
-                COMPRESS_TIMEOUT_SECONDS, duration,
-            )
+            logger.error("ffmpeg сжатие не уложилось в %s сек", COMPRESS_TIMEOUT_SECONDS)
             proc.kill()
             await proc.wait()
             return data
 
         if proc.returncode != 0 or not os.path.exists(dst_path):
-            stderr_text = stderr.decode(errors="ignore")
-            logger.error(
-                "ffmpeg сжатие не удалось (код %s, длительность видео %.1f сек, height=%s): %s",
-                proc.returncode, duration, height, stderr_text[-4000:],
-            )
+            logger.error("ffmpeg сжатие не удалось: %s", stderr.decode(errors="ignore")[-4000:])
             return data
 
         with open(dst_path, "rb") as f:
             compressed = f.read()
-
-        if not compressed or len(compressed) >= len(data):
-            return data
-        return compressed
-
-
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Голосовые/аудио-сообщения: скачиваем, распознаём через Whisper, отвечаем как на текст."""
-    if openai_client is None:
-        await update.message.reply_text(
-            "Распознавание голоса ещё не настроено (нет ключа OpenAI). "
-            "Напиши, пожалуйста, то же самое текстом."
-        )
-        return
-
-    voice = update.message.voice or update.message.audio
-    if voice is None:
-        return
-
-    await update.message.reply_text("Слушаю голосовое...")
-    await update.message.chat.send_action("typing")
-
-    try:
-        tg_file = await context.bot.get_file(voice.file_id)
-        data = await download_telegram_file(tg_file)
-        buf = io.BytesIO(data)
-        buf.seek(0)
-        buf.name = "voice.ogg"  # Whisper API определяет формат по расширению имени файла
-
-        transcript = openai_client.audio.transcriptions.create(
-            model="whisper-1",
-            file=buf,
-        )
-        recognized_text = transcript.text.strip()
-
-        if not recognized_text:
-            await update.message.reply_text(
-                "Не расслышала, там как будто пусто. Попробуй ещё раз или напиши текстом."
-            )
-            return
-
-        await update.message.reply_text(f"Расслышала: «{recognized_text}»")
-
-        chat_id = update.effective_chat.id
-        await ask_claude_and_reply(update, chat_id, recognized_text)
-
-    except Exception as e:
-        logger.exception("Voice transcription error")
-        await update.message.reply_text(
-            f"Не получилось распознать голосовое: {e}\n"
-            "Попробуй ещё раз или напиши текстом."
-        )
+        return compressed if compressed and len(compressed) < len(data) else data
 
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Принимает видео (как видео-сообщение или как документ) и загружает на Cloudinary."""
+    """Принимает видео и загружает на Cloudinary."""
     video = update.message.video or update.message.document
     if video is None:
         return
 
-    # Проверяем размер заранее, чтобы не тратить время и не пугать техническим текстом ошибки.
     file_size = getattr(video, "file_size", None)
     if file_size and file_size > TELEGRAM_BOT_FILE_LIMIT:
-        size_mb = file_size / (1024 * 1024)
         await update.message.reply_text(
-            f"Файл весит {size_mb:.1f} МБ — это больше {TELEGRAM_BOT_FILE_LIMIT / 1024 / 1024:.0f} МБ, "
-            "текущего лимита на скачивание файлов ботом.\n\n"
-            "Залей на Google Drive/Dropbox с доступом «по ссылке» и пришли мне ссылку текстом."
+            f"Файл весит {file_size / 1048576:.0f} МБ — это больше лимита 2 ГБ.\n"
+            "Залей на Google Drive/Dropbox с доступом «по ссылке» и пришли ссылку."
         )
         return
 
-    await update.message.reply_text("Загружаю видео, подожди немного...")
-    await update.message.chat.send_action("upload_video")
+    status = await update.message.reply_text("Загружаю видео, подожди немного...")
+    await update.effective_chat.send_action("upload_video")
 
     try:
         tg_file = await context.bot.get_file(video.file_id)
         data = await download_telegram_file(tg_file)
 
         if len(data) > CLOUDINARY_MAX_BYTES:
-            await update.message.reply_text(
-                f"Видео весит {len(data) / 1024 / 1024:.0f} МБ — это больше 100 МБ, "
-                "лимита Cloudinary на загрузку. Сжимаю — для 4K-видео это может занять "
-                "несколько минут, не переживай, если ответ придёт не сразу..."
+            await status.edit_text(
+                f"Видео весит {len(data) / 1048576:.0f} МБ — сжимаю под лимит. "
+                "Для 4K это может занять несколько минут..."
             )
             data = await compress_video_if_needed(data)
             if len(data) > CLOUDINARY_MAX_BYTES:
                 await update.message.reply_text(
-                    "Не получилось сжать видео до нужного размера (меньше 100 МБ) — "
-                    "возможно, не хватило времени или ресурсов на сервере для этого конкретного файла.\n\n"
-                    "Сожми его вручную (например, в Telegram при отправке, там есть опция "
-                    "«меньший размер») или залей на Google Drive/Dropbox с доступом «по ссылке» "
-                    "и пришли мне ссылку текстом."
+                    "Не получилось сжать видео меньше 100 МБ. Сожми его при отправке в Telegram "
+                    "или залей на Google Drive/Dropbox и пришли ссылку."
                 )
                 return
 
         buf = io.BytesIO(data)
-        buf.seek(0)
-
-        upload_result = cloudinary.uploader.upload_large(
-            buf,
-            resource_type="video",
-            folder="anna_producer_bot",
+        upload_result = await asyncio.to_thread(
+            cloudinary.uploader.upload_large, buf, resource_type="video", folder="anna_producer_bot",
         )
         public_url = upload_result["secure_url"]
 
         await update.message.reply_text(
             "Готово! Публичная ссылка на видео:\n\n"
             f"{public_url}\n\n"
-            "Вставь эту ссылку в чат с агентом «Анна» в Claude (Project) — "
-            "там подключён монтаж, и агент сам разберёт и смонтирует ролик."
+            "Вставь эту ссылку в чат с агентом «Анна» в Claude (Project) — там подключён монтаж."
         )
     except Exception as e:
         logger.exception("Video upload error")
-        error_text = str(e)
-        if "too big" in error_text.lower() or "file is too big" in error_text.lower() or "too large" in error_text.lower():
-            await update.message.reply_text(
-                "Файл слишком большой для загрузки (даже после сжатия).\n\n"
-                "Сожми видео вручную или залей на Google Drive/Dropbox и пришли ссылку."
-            )
-        else:
-            await update.message.reply_text(
-                f"Не получилось загрузить видео: {e}\n"
-                "Попробуй ещё раз или залей вручную на Google Drive и пришли ссылку."
-            )
+        await update.message.reply_text(
+            f"Не получилось загрузить видео: {e}\nПопробуй ещё раз или залей на Google Drive и пришли ссылку."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Фото и документы
+# ---------------------------------------------------------------------------
+DEFAULT_IMAGE_PROMPT = (
+    "Посмотри на это изображение и прокомментируй его содержательно — как продюсер, "
+    "если это релевантно контенту Анны, или просто по существу, если это что-то другое."
+)
+SUPPORTED_IMAGE_MIMES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Фото: скачиваем, отправляем в Claude как изображение (у Claude есть зрение), отвечаем."""
+    """Фото: отправляем в Claude как изображение (у Claude есть зрение)."""
     photo = update.message.photo[-1] if update.message.photo else None
     if photo is None:
         return
-
     caption = (update.message.caption or "").strip()
-
-    await update.message.chat.send_action("typing")
+    await update.effective_chat.send_action("typing")
 
     try:
         tg_file = await context.bot.get_file(photo.file_id)
         data = await download_telegram_file(tg_file)
-        image_b64 = base64.b64encode(data).decode("utf-8")
-
-        chat_id = update.effective_chat.id
-        history = conversations.setdefault(chat_id, [])
-
-        vision_prompt = caption if caption else (
-            "Посмотри на это фото и прокомментируй его содержательно — как продюсер, "
-            "если это релевантно контенту Анны, или просто по существу, если это что-то другое."
-        )
-
-        history.append({
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/jpeg",
-                        "data": image_b64,
-                    },
-                },
-                {"type": "text", "text": vision_prompt},
-            ],
-        })
-        history_for_model = history[-MAX_HISTORY_MESSAGES:]
-
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=2000,
-            system=SYSTEM_PROMPT,
-            messages=history_for_model,
-        )
-        reply_text = "".join(
-            block.text for block in response.content if block.type == "text"
-        )
-
-        # В истории саму картинку текстом не храним (не нужно раздувать файл) — оставляем заметку.
-        user_note = f"[Фото] {caption}" if caption else "[Фото без подписи]"
-        history[-1] = {"role": "user", "content": user_note}
-        history.append({"role": "assistant", "content": reply_text})
-        conversations[chat_id] = history[-MAX_HISTORY_MESSAGES:]
-        _save_conversations()
-
-        await update.message.reply_text(reply_text)
-
     except Exception as e:
-        logger.exception("Photo analysis error")
-        await update.message.reply_text(
-            f"Не получилось разобрать фото: {e}\nПопробуй ещё раз."
-        )
+        logger.exception("Photo download error")
+        await update.message.reply_text(f"Не получилось скачать фото: {e}\nПопробуй ещё раз.")
+        return
+
+    content = [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": base64.b64encode(data).decode()}},
+        {"type": "text", "text": caption or DEFAULT_IMAGE_PROMPT},
+    ]
+    note = f"[Фото] {caption}" if caption else "[Фото без подписи]"
+    await ask_claude(update, update.effective_chat.id, content, history_note=note)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Файлы-документы: PDF и изображения, отправленные как файл (не сжатые фото)."""
+    """Файлы-документы: PDF, изображения, текстовые файлы."""
     doc = update.message.document
     if doc is None:
         return
 
     mime = (doc.mime_type or "").lower()
     file_name = doc.file_name or ""
+    lower_name = file_name.lower()
     caption = (update.message.caption or "").strip()
 
-    is_pdf = mime == "application/pdf" or file_name.lower().endswith(".pdf")
-    is_image = mime.startswith("image/")
+    is_pdf = mime == "application/pdf" or lower_name.endswith(".pdf")
+    is_image = mime in SUPPORTED_IMAGE_MIMES
+    is_text = mime.startswith("text/") or lower_name.endswith((".txt", ".md", ".csv", ".json"))
+    is_audio = mime.startswith("audio/") or lower_name.endswith((".mp3", ".m4a", ".ogg", ".wav", ".opus"))
 
-    if not is_pdf and not is_image:
+    if is_audio:
+        await handle_audio_document(update, context, doc)
+        return
+
+    if not (is_pdf or is_image or is_text):
         await update.message.reply_text(
             f"Пока не умею читать файлы такого типа ({mime or 'неизвестный формат'}).\n"
-            "Поддерживаю: PDF и изображения (файлом или как фото). Видео — тоже ок, грузится отдельно."
+            "Поддерживаю: PDF, изображения, текстовые файлы, аудио и видео."
         )
         return
 
-    file_size = getattr(doc, "file_size", None)
-    if file_size and file_size > TELEGRAM_BOT_FILE_LIMIT:
-        size_mb = file_size / (1024 * 1024)
-        await update.message.reply_text(
-            f"Файл весит {size_mb:.1f} МБ — это больше {TELEGRAM_BOT_FILE_LIMIT / 1024 / 1024:.0f} МБ, "
-            "текущего лимита на скачивание файлов ботом."
-        )
+    if doc.file_size and doc.file_size > 30 * 1024 * 1024:
+        await update.message.reply_text("Файл больше 30 МБ — такой не смогу разобрать целиком. Пришли поменьше.")
         return
 
-    await update.message.chat.send_action("typing")
-
+    await update.effective_chat.send_action("typing")
     try:
         tg_file = await context.bot.get_file(doc.file_id)
         data = await download_telegram_file(tg_file)
-        file_b64 = base64.b64encode(data).decode("utf-8")
-
-        chat_id = update.effective_chat.id
-        history = conversations.setdefault(chat_id, [])
-
-        if is_pdf:
-            content_block = {
-                "type": "document",
-                "source": {"type": "base64", "media_type": "application/pdf", "data": file_b64},
-            }
-            default_prompt = "Посмотри этот PDF и разбери содержимое по существу."
-            note_label = f"[PDF: {file_name}]"
-        else:
-            content_block = {
-                "type": "image",
-                "source": {"type": "base64", "media_type": mime, "data": file_b64},
-            }
-            default_prompt = (
-                "Посмотри на это изображение и прокомментируй его содержательно — как продюсер, "
-                "если это релевантно контенту Анны, или просто по существу, если это что-то другое."
-            )
-            note_label = f"[Изображение-файл: {file_name}]"
-
-        vision_prompt = caption if caption else default_prompt
-
-        history.append({
-            "role": "user",
-            "content": [content_block, {"type": "text", "text": vision_prompt}],
-        })
-        history_for_model = history[-MAX_HISTORY_MESSAGES:]
-
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=2000,
-            system=SYSTEM_PROMPT,
-            messages=history_for_model,
-        )
-        reply_text = "".join(
-            block.text for block in response.content if block.type == "text"
-        )
-
-        user_note = f"{note_label} {caption}" if caption else note_label
-        history[-1] = {"role": "user", "content": user_note}
-        history.append({"role": "assistant", "content": reply_text})
-        conversations[chat_id] = history[-MAX_HISTORY_MESSAGES:]
-        _save_conversations()
-
-        await update.message.reply_text(reply_text)
-
     except Exception as e:
-        logger.exception("Document analysis error")
-        await update.message.reply_text(
-            f"Не получилось разобрать файл: {e}\nПопробуй ещё раз."
-        )
+        logger.exception("Document download error")
+        await update.message.reply_text(f"Не получилось скачать файл: {e}\nПопробуй ещё раз.")
+        return
+
+    if is_pdf:
+        block = {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": base64.b64encode(data).decode()}}
+        default_prompt = "Посмотри этот PDF и разбери содержимое по существу."
+        note_label = f"[PDF: {file_name}]"
+    elif is_image:
+        block = {"type": "image", "source": {"type": "base64", "media_type": mime, "data": base64.b64encode(data).decode()}}
+        default_prompt = DEFAULT_IMAGE_PROMPT
+        note_label = f"[Изображение-файл: {file_name}]"
+    else:
+        block = {"type": "text", "text": f"[Файл {file_name}]:\n{data.decode('utf-8', errors='ignore')[:60000]}"}
+        default_prompt = "Разбери этот файл по существу."
+        note_label = f"[Файл: {file_name}]"
+
+    content = [block, {"type": "text", "text": caption or default_prompt}]
+    note = f"{note_label} {caption}" if caption else note_label
+    await ask_claude(update, update.effective_chat.id, content, history_note=note)
+
+
+async def handle_audio_document(update: Update, context: ContextTypes.DEFAULT_TYPE, doc) -> None:
+    """Аудио, присланное файлом (например, запись из диктофона)."""
+    if openai_client is None:
+        await update.message.reply_text("Распознавание голоса не настроено (нет ключа OpenAI).")
+        return
+    status = await update.message.reply_text("Слушаю запись... 🎧")
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        data = await download_telegram_file(tg_file)
+        text = await transcribe(data, doc.file_name or "audio.mp3")
+    except Exception as e:
+        logger.exception("Audio document error")
+        await status.edit_text(f"Не получилось распознать запись: {e}")
+        return
+    if not text:
+        await status.edit_text("В записи не слышно речи.")
+        return
+    shown = text if len(text) <= 700 else text[:700] + "…"
+    try:
+        await status.edit_text(f"🎙 «{shown}»")
+    except BadRequest:
+        pass
+    caption = (update.message.caption or "").strip()
+    await process_user_text(update, f"{caption}\n\n{text}" if caption else text)
+
+
+# ---------------------------------------------------------------------------
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Необработанная ошибка", exc_info=context.error)
 
 
 def main() -> None:
-    # Свой (self-hosted) Telegram Bot API сервер — снимает стандартный лимит Telegram
-    # в 20 МБ на скачивание файлов ботом (там теперь безлимитно на download, до 2 ГБ на
-    # upload). Сервер telegram-bot-api и этот процесс запускаются в ОДНОМ контейнере
-    # (см. start.sh) и делят общий диск — это обязательно для режима --local, в котором
-    # getFile отдаёт абсолютный локальный путь вместо ссылки для HTTP-скачивания
-    # (см. download_telegram_file выше).
+    # Свой (self-hosted) Telegram Bot API сервер — снимает лимит 20 МБ на скачивание файлов.
+    # Сервер и бот работают в одном контейнере (см. start.sh) и делят общий диск.
     local_api_url = os.environ.get("LOCAL_BOT_API_URL", "http://localhost:8081")
     app = (
         Application.builder()
@@ -841,15 +860,19 @@ def main() -> None:
         .read_timeout(120)
         .write_timeout(120)
         .pool_timeout(60)
+        .concurrent_updates(True)  # обрабатываем сообщения параллельно, порядок в чате держит chat_locks
         .build()
     )
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.Document.ALL & ~filters.Document.VIDEO, handle_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("Bot started")
+    app.add_handler(CommandHandler("id", show_id))
+    app.add_handler(CommandHandler("start", guarded(start)))
+    app.add_handler(CommandHandler("new", guarded(new_dialog)))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, guarded(handle_video)))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE, guarded(handle_voice)))
+    app.add_handler(MessageHandler(filters.PHOTO, guarded(handle_photo)))
+    app.add_handler(MessageHandler(filters.Document.ALL & ~filters.Document.VIDEO, guarded(handle_document)))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, guarded(handle_message)))
+    app.add_error_handler(on_error)
+    logger.info("Bot started (model=%s, access=%s)", CLAUDE_MODEL, "restricted" if ALLOWED_USER_IDS else "open")
     app.run_polling()
 
 
