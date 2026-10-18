@@ -146,7 +146,8 @@ def build_stats(data: dict) -> dict:
         for name, v in by_kind.items()
     }
 
-    dated = sorted([r for r in rows if r["dt"]], key=lambda r: r["dt"])
+    # закреплённые посты бывают старыми — они искажают период и частоту, поэтому их не считаем
+    dated = sorted([r for r in rows if r["dt"] and not r["pinned"]], key=lambda r: r["dt"])
     per_week = None
     if len(dated) >= 2:
         span_days = max((dated[-1]["dt"] - dated[0]["dt"]).days, 1)
