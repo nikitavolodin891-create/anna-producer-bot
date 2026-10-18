@@ -19,7 +19,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import anthropic
 from openai import AsyncOpenAI
 
-from prompt import SYSTEM_PROMPT as ANNA_PROMPT, LINK_ANALYSIS_PROMPT, VIDEO_REVIEW_PROMPT, AUDIT_PROMPT, TRENDS_PROMPT
+from prompt import SYSTEM_PROMPT as ANNA_PROMPT, LINK_ANALYSIS_PROMPT, VIDEO_REVIEW_PROMPT, AUDIT_PROMPT, TRENDS_PROMPT, EDITOR_PROMPT
 import social
 import audit
 import trends
@@ -238,6 +238,8 @@ async def ask_claude(
                 messages=messages,
             )
             reply_text = "".join(block.text for block in response.content if block.type == "text")
+            if response.stop_reason != "max_tokens" and needs_editing(reply_text):
+                reply_text = await edit_draft(reply_text, max_tokens or CLAUDE_MAX_TOKENS)
         except anthropic.APIStatusError as e:
             logger.exception("Anthropic API error")
             if e.status_code == 529 or e.status_code >= 500:
@@ -270,6 +272,40 @@ async def ask_claude(
 
     await send_long(update, reply_text)
     return full_reply
+
+
+# Признаки того, что в ответе есть контент для публикации (хуки, сценарии, подписи) —
+# такие ответы проходят вторую вычитку строгим редактором.
+CONTENT_MARKERS_RE = re.compile(r"(\[ХУК|\[ГОЛОС|\[ТЕКСТ НА ЭКРАНЕ|\[ПОДПИСЬ|подпись к посту|сценари[йия]\s*\d|хуки?\s+для)", re.I)
+EDITOR_ENABLED = os.environ.get("EDITOR_ENABLED", "1") != "0"
+
+
+def needs_editing(text: str) -> bool:
+    return EDITOR_ENABLED and len(text) > 600 and bool(CONTENT_MARKERS_RE.search(text))
+
+
+async def edit_draft(draft: str, max_tokens: int) -> str:
+    """Второй проход: редактор вычищает тройки, выдуманную биографию, повторы призывов.
+    Если что-то пошло не так — возвращаем черновик как есть (ответ пользователь получит в любом случае)."""
+    memory = MEMORY_RE.search(draft)
+    body = MEMORY_RE.sub("", draft).strip()
+    try:
+        resp = await client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=max_tokens,
+            system=EDITOR_PROMPT,
+            messages=[{"role": "user", "content": f"ЧЕРНОВИК:\n\n{body}"}],
+        )
+        edited = "".join(b.text for b in resp.content if b.type == "text").strip()
+        edited = MEMORY_RE.sub("", edited).strip()
+        if resp.stop_reason == "max_tokens" or len(edited) < len(body) * 0.6:
+            logger.warning("Редактор вернул неполный текст (%s → %s симв.) — оставляю черновик", len(body), len(edited))
+            return draft
+        logger.info("Редактор: %s → %s симв.", len(body), len(edited))
+        return edited + (f"\n\n{memory.group(0)}" if memory else "")
+    except Exception:
+        logger.exception("Редактор не сработал — отправляю черновик")
+        return draft
 
 
 async def _keep_typing(update: Update) -> None:
