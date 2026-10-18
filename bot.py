@@ -25,6 +25,8 @@ from prompt import SYSTEM_PROMPT as ANNA_PROMPT, LINK_ANALYSIS_PROMPT
 import social
 
 logging.basicConfig(level=logging.INFO)
+# httpx пишет в лог каждый запрос к Telegram вместе с токеном бота в URL — глушим
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
