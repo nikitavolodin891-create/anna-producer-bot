@@ -19,11 +19,12 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import anthropic
 from openai import AsyncOpenAI
 
-from prompt import SYSTEM_PROMPT as ANNA_PROMPT, LINK_ANALYSIS_PROMPT, VIDEO_REVIEW_PROMPT, AUDIT_PROMPT, TRENDS_PROMPT, EDITOR_PROMPT, SCRIPT_FORMAT_NOTE
+from prompt import SYSTEM_PROMPT as ANNA_PROMPT, LINK_ANALYSIS_PROMPT, VIDEO_REVIEW_PROMPT, AUDIT_PROMPT, TRENDS_PROMPT, EDITOR_PROMPT, SCRIPT_FORMAT_NOTE, FIXER_PROMPT
 import social
 import audit
 import trends
 import facts
+import lint
 
 logging.basicConfig(level=logging.INFO)
 # httpx пишет в лог каждый запрос к Telegram вместе с токеном бота в URL — глушим
@@ -294,6 +295,34 @@ def needs_editing(text: str) -> bool:
     return EDITOR_ENABLED and len(text) > 600 and bool(CONTENT_MARKERS_RE.search(text))
 
 
+async def fix_lint_issues(text: str, max_tokens: int) -> str:
+    """Третий шаг: код находит выдуманные эпизоды и цепочки повторов — модель точечно их исправляет.
+    Делаем до 2 раундов; если что-то идёт не так — возвращаем текст как есть."""
+    facts_text = facts.prompt_block(DATA_DIR)
+    for round_no in (1, 2):
+        issues = lint.find_issues(text, facts_text)
+        if not issues:
+            return text
+        logger.info("Проверка (раунд %s): %s проблем — %s", round_no, len(issues), [i[:60] for i in issues])
+        try:
+            resp = await client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=max_tokens,
+                system=FIXER_PROMPT + _editor_facts(),
+                messages=[{"role": "user", "content": "ПРОБЛЕМЫ:\n" + "\n".join(f"{i+1}. {x}" for i, x in enumerate(issues))
+                           + f"\n\nТЕКСТ:\n\n{text}"}],
+            )
+            fixed = MEMORY_RE.sub("", "".join(b.text for b in resp.content if b.type == "text")).strip()
+            if resp.stop_reason == "max_tokens" or len(fixed) < len(text) * 0.75:
+                logger.warning("Фиксер вернул неполный текст — оставляю как было")
+                return text
+            text = fixed
+        except Exception:
+            logger.exception("Фиксер не сработал")
+            return text
+    return text
+
+
 def _editor_facts() -> str:
     block = facts.prompt_block(DATA_DIR)
     if not block:
@@ -320,6 +349,7 @@ async def edit_draft(draft: str, max_tokens: int) -> str:
             logger.warning("Редактор вернул неполный текст (%s → %s симв.) — оставляю черновик", len(body), len(edited))
             return draft
         logger.info("Редактор: %s → %s симв.", len(body), len(edited))
+        edited = await fix_lint_issues(edited, max_tokens)
         return edited + (f"\n\n{memory.group(0)}" if memory else "")
     except Exception:
         logger.exception("Редактор не сработал — отправляю черновик")
