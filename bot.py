@@ -8,8 +8,6 @@ import logging
 import asyncio
 import tempfile
 import shutil
-import time
-import types
 from collections import defaultdict
 
 import httpx
@@ -19,13 +17,10 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import anthropic
-import cloudinary
-import cloudinary.uploader
 from openai import AsyncOpenAI
 
-from prompt import SYSTEM_PROMPT as ANNA_PROMPT, LINK_ANALYSIS_PROMPT, MONTAGE_PLAN_PROMPT, AUDIT_PROMPT, TRENDS_PROMPT
+from prompt import SYSTEM_PROMPT as ANNA_PROMPT, LINK_ANALYSIS_PROMPT, VIDEO_REVIEW_PROMPT, AUDIT_PROMPT, TRENDS_PROMPT
 import social
-import montage
 import audit
 import trends
 
@@ -49,14 +44,6 @@ ALLOWED_USER_IDS = {
 # Асинхронные клиенты: пока Claude думает над одним сообщением, бот не зависает для остальных.
 client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
-# Cloudinary — публичный хостинг для видео
-cloudinary.config(
-    cloud_name=os.environ.get("CLOUDINARY_CLOUD_NAME"),
-    api_key=os.environ.get("CLOUDINARY_API_KEY"),
-    api_secret=os.environ.get("CLOUDINARY_API_SECRET"),
-    secure=True,
-)
 
 FORMAT_NOTE = """
 
@@ -148,58 +135,10 @@ def current_system_prompt() -> str:
     return prompt
 
 
-# Ответы старой версии бота «я текстовый, монтировать не могу» — неправда с тех пор, как появился
-# автомонтаж. Если их оставить в истории, Claude будет их повторять. Вырезаем такие пары.
-STALE_REPLY_RE = re.compile(
-    r"(текстов(ый|ая)\s+(бот|ии|ассистент)|не\s+(могу|умею)\s+(сама?\s+)?(монтир|смонтир)|монтаж\s+видео\s+не\s+мой|"
-    r"нет\s+(здесь\s+)?доступа\s+к\s+монтаж)",
-    re.I,
-)
-
-
-def _drop_stale_replies(history: list[dict]) -> list[dict]:
-    out: list[dict] = []
-    for msg in history:
-        if msg.get("role") == "assistant" and isinstance(msg.get("content"), str) and STALE_REPLY_RE.search(msg["content"]):
-            if out and out[-1].get("role") == "user":
-                out.pop()  # вопрос, на который был дан устаревший ответ
-            continue
-        out.append(msg)
-    return out
-
-
 conversations: dict[int, list[dict]] = {
-    chat_id: _sanitize_history(_drop_stale_replies(h)) for chat_id, h in _load_conversations().items()
+    chat_id: _sanitize_history(h) for chat_id, h in _load_conversations().items()
 }
 chat_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
-
-LAST_VIDEO_FILE = os.path.join(DATA_DIR, "last_videos.json")
-LAST_VIDEO_TTL = 3 * 24 * 3600  # «смонтируй» без видео — берём последнее, присланное за 3 дня
-
-
-def _load_last_videos() -> dict[int, dict]:
-    try:
-        with open(LAST_VIDEO_FILE, encoding="utf-8") as f:
-            return {int(k): v for k, v in json.load(f).items()}
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    except Exception:
-        logger.exception("Не удалось прочитать last_videos")
-        return {}
-
-
-last_videos: dict[int, dict] = _load_last_videos()
-
-
-def remember_video(chat_id: int, file_id: str, file_size: int | None) -> None:
-    last_videos[chat_id] = {"file_id": file_id, "file_size": file_size, "at": time.time()}
-    try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        with open(LAST_VIDEO_FILE, "w", encoding="utf-8") as f:
-            json.dump(last_videos, f)
-    except Exception:
-        logger.exception("Не удалось сохранить last_videos")
-
 
 # ---------------------------------------------------------------------------
 # Отправка ответов: разбивка длинных текстов + форматирование
@@ -393,8 +332,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Понимаю голосовые и кружки 🎙\n"
         "• Разбираю рилсы и посты по ссылке (Instagram, TikTok, YouTube)\n"
         "• Читаю фото, PDF и сайты\n"
-        "• Монтирую Reels: пришли видео — верну готовый ролик с субтитрами 🎬\n"
-        "  (в подписи к видео можно написать пожелания, например «динамично»)\n\n"
+        "• Разбираю твои видео: пришли ролик — скажу, что с хуком и что улучшить 🎬\n\n"
         "Просто напиши или наговори, что нужно.\n"
         "/trends — что сейчас залетает в нише + 15 хуков для тебя\n"
         "/audit — аудит твоего Инстаграма (или /audit @ник — любого аккаунта)\n"
@@ -638,9 +576,6 @@ async def process_user_text(update: Update, user_text: str) -> None:
     urls = URL_RE.findall(user_text)[:MAX_LINKS_PER_MESSAGE]
 
     if not urls:
-        if MONTAGE_INTENT_RE.search(user_text):
-            await montage_from_text(update, user_text)
-            return
         if TRENDS_INTENT_RE.search(user_text):
             await run_trends(update, topic=user_text)
             return
@@ -839,94 +774,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # ---------------------------------------------------------------------------
-# Видео: сжатие и заливка на Cloudinary (режим «просто ссылка»)
+# Видео: продюсерский разбор ролика (речь + кадры)
 # ---------------------------------------------------------------------------
-CLOUDINARY_MAX_BYTES = 100 * 1024 * 1024
-COMPRESS_TARGET_BYTES = int(CLOUDINARY_MAX_BYTES * 0.9)
-COMPRESS_MAX_HEIGHT = 1080
-COMPRESS_TIMEOUT_SECONDS = 480
-
-
-async def _ffprobe_video_info(path: str) -> dict | None:
-    """Длительность и высота видео через ffprobe."""
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "ffprobe", "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "format=duration:stream=height",
-            "-of", "default=noprint_wrappers=1",
-            path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        stdout, _ = await proc.communicate()
-        info: dict = {}
-        for line in stdout.decode(errors="ignore").splitlines():
-            if "=" in line:
-                key, _, value = line.partition("=")
-                info[key.strip()] = value.strip()
-        duration = float(info.get("duration", 0) or 0)
-        height = int(info.get("height", 0) or 0)
-        if duration <= 0:
-            return None
-        return {"duration": duration, "height": height}
-    except Exception:
-        logger.exception("ffprobe не смог определить параметры видео")
-        return None
-
-
-async def compress_video_if_needed(data: bytes) -> bytes:
-    """Пережимает видео больше 100 МБ под лимит Cloudinary (с даунскейлом до 1080p)."""
-    if len(data) <= CLOUDINARY_MAX_BYTES:
-        return data
-
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        src_path = os.path.join(tmp_dir, "in.mp4")
-        dst_path = os.path.join(tmp_dir, "out.mp4")
-        with open(src_path, "wb") as f:
-            f.write(data)
-
-        try:
-            free_bytes = shutil.disk_usage(tmp_dir).free
-            logger.info("Сжатие видео: %.1f МБ, свободно %.1f МБ", len(data) / 1048576, free_bytes / 1048576)
-        except Exception:
-            pass
-
-        info = await _ffprobe_video_info(src_path)
-        if not info:
-            return data
-        duration, height = info["duration"], info["height"]
-
-        audio_kbps = 128
-        target_total_kbps = (COMPRESS_TARGET_BYTES * 8 / 1000) / duration
-        video_kbps = max(int(target_total_kbps - audio_kbps), 150)
-
-        cmd = ["ffmpeg", "-y", "-threads", "2", "-filter_threads", "2", "-i", src_path]
-        if height and height > COMPRESS_MAX_HEIGHT:
-            cmd += ["-vf", f"scale=-2:{COMPRESS_MAX_HEIGHT}"]
-        cmd += [
-            "-c:v", "libx264", "-preset", "veryfast", "-threads", "2", "-x264-params", "rc-lookahead=10",
-            "-b:v", f"{video_kbps}k", "-maxrate", f"{video_kbps}k", "-bufsize", f"{video_kbps * 2}k",
-            "-c:a", "aac", "-b:a", f"{audio_kbps}k",
-            "-movflags", "+faststart",
-            dst_path,
-        ]
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-        try:
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=COMPRESS_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
-            logger.error("ffmpeg сжатие не уложилось в %s сек", COMPRESS_TIMEOUT_SECONDS)
-            proc.kill()
-            await proc.wait()
-            return data
-
-        if proc.returncode != 0 or not os.path.exists(dst_path):
-            logger.error("ffmpeg сжатие не удалось: %s", stderr.decode(errors="ignore")[-4000:])
-            return data
-
-        with open(dst_path, "rb") as f:
-            compressed = f.read()
-        return compressed if compressed and len(compressed) < len(data) else data
+VIDEO_MAX_SECONDS = int(os.environ.get("VIDEO_MAX_SECONDS", "900"))  # до 15 минут
 
 
 async def save_telegram_file(tg_file, dst: str) -> None:
@@ -938,131 +788,8 @@ async def save_telegram_file(tg_file, dst: str) -> None:
         await tg_file.download_to_drive(dst)
 
 
-async def upload_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE, video) -> None:
-    """Старый режим: просто загрузить видео на Cloudinary и дать публичную ссылку."""
-    status = await update.message.reply_text("Загружаю видео, подожди немного...")
-    await update.effective_chat.send_action("upload_video")
-    try:
-        tg_file = await context.bot.get_file(video.file_id)
-        data = await download_telegram_file(tg_file)
-
-        if len(data) > CLOUDINARY_MAX_BYTES:
-            await status.edit_text(
-                f"Видео весит {len(data) / 1048576:.0f} МБ — сжимаю под лимит. "
-                "Для 4K это может занять несколько минут..."
-            )
-            data = await compress_video_if_needed(data)
-            if len(data) > CLOUDINARY_MAX_BYTES:
-                await update.message.reply_text(
-                    "Не получилось сжать видео меньше 100 МБ. Сожми его при отправке в Telegram "
-                    "или залей на Google Drive/Dropbox и пришли ссылку."
-                )
-                return
-
-        upload_result = await asyncio.to_thread(
-            cloudinary.uploader.upload_large, io.BytesIO(data), resource_type="video", folder="anna_producer_bot",
-        )
-        await update.message.reply_text(f"Готово! Публичная ссылка на видео:\n\n{upload_result['secure_url']}")
-    except Exception as e:
-        logger.exception("Video upload error")
-        await update.message.reply_text(f"Не получилось загрузить видео: {e}\nПопробуй ещё раз.")
-
-
-# ---------------------------------------------------------------------------
-# Автомонтаж
-# ---------------------------------------------------------------------------
-LINK_MODE_RE = re.compile(r"(ссылк|cloudinary|без монтажа|не монтир)", re.I)
-MONTAGE_MAX_SECONDS = int(os.environ.get("MONTAGE_MAX_SECONDS", "600"))  # до 10 минут исходника
-WHISPER_LANGS = {"russian": "ru", "english": "en", "ukrainian": "uk", "spanish": "es", "german": "de", "french": "fr"}
-
-
-async def transcribe_words(video_path: str) -> tuple[list[montage.Word], str, str]:
-    """Расшифровка с таймкодом каждого слова — по ним режем паузы и ставим субтитры."""
-    audio_path = video_path + ".mp3"
-    proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-y", "-threads", "2", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", audio_path,
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-    )
-    await proc.wait()
-    if proc.returncode != 0 or not os.path.exists(audio_path):
-        return [], "", "ru"
-    if os.path.getsize(audio_path) > WHISPER_MAX_BYTES:
-        raise RuntimeError("видео слишком длинное для расшифровки")
-    with open(audio_path, "rb") as f:
-        resp = await openai_client.audio.transcriptions.create(
-            model="whisper-1",
-            file=("audio.mp3", f.read()),
-            response_format="verbose_json",
-            timestamp_granularities=["word"],
-        )
-    words = [
-        montage.Word(w.word.strip(), float(w.start), float(w.end))
-        for w in (getattr(resp, "words", None) or [])
-        if w.word.strip()
-    ]
-    lang = WHISPER_LANGS.get((getattr(resp, "language", "") or "").lower(), "ru")
-    return words, (resp.text or "").strip(), lang
-
-
-async def make_montage_plan(transcript: str, wishes: str) -> montage.Plan:
-    """Claude-продюсер решает: хук-заголовок, темп, наезды/перебивки, подпись к посту."""
-    if not transcript and not wishes:
-        return montage.Plan(hook_title="")
-    prompt = MONTAGE_PLAN_PROMPT.format(
-        transcript=transcript[:8000] or "(речи нет или не распознана)",
-        wishes=wishes or "(нет — реши сама как продюсер)",
-    )
-    try:
-        resp = await client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=2500,
-            system=current_system_prompt(),
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = "".join(b.text for b in resp.content if b.type == "text")
-        return montage.parse_plan(text)
-    except Exception:
-        logger.exception("Не удалось составить план монтажа")
-        return montage.Plan()
-
-
-def _mmss(seconds: float) -> str:
-    seconds = int(round(seconds))
-    return f"{seconds // 60}:{seconds % 60:02d}"
-
-
-async def remember(chat_id: int, user_note: str, assistant_text: str) -> None:
-    async with chat_locks[chat_id]:
-        history = conversations.get(chat_id, []) + [
-            {"role": "user", "content": user_note},
-            {"role": "assistant", "content": assistant_text},
-        ]
-        conversations[chat_id] = _sanitize_history(history[-MAX_HISTORY_MESSAGES:])
-        _save_conversations()
-
-
-MONTAGE_INTENT_RE = re.compile(r"(смонтир|отмонтир|перемонтир|монтаж|монтир|нарежь|наложи\s+субтитр|сделай\s+(из\s+)?(этого\s+)?(видео|ролик|рилс))", re.I)
-
-
-async def montage_from_text(update: Update, wishes: str) -> None:
-    """«Сделай монтаж» текстом/голосом → монтируем последнее присланное видео."""
-    chat_id = update.effective_chat.id
-    saved = last_videos.get(chat_id)
-    if not saved or time.time() - saved.get("at", 0) > LAST_VIDEO_TTL:
-        await update.effective_message.reply_text(
-            "Конечно смонтирую 🎬 Пришли видео файлом: скрепка → Галерея → выбери ролик.\n\n"
-            "В подписи к видео можно сразу написать пожелания: «динамично», «спокойно», «без субтитров», "
-            "«с перебивками». Через пару минут верну готовый ролик с субтитрами, хуком и подписью к посту."
-        )
-        return
-    await update.effective_message.reply_text("Беру последнее видео, которое ты присылала 👌")
-    video = types.SimpleNamespace(file_id=saved["file_id"], file_size=saved.get("file_size"))
-    context = types.SimpleNamespace(bot=update.get_bot())
-    await montage_video(update, context, video, wishes)
-
-
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Видео → автомонтаж. Если в подписи «ссылка» / «без монтажа» — просто публичная ссылка."""
+    """Видео → расшифровка речи + кадры → продюсерский разбор от Claude."""
     msg = update.message
     video = msg.video or msg.document
     if video is None:
@@ -1070,163 +797,79 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     file_size = getattr(video, "file_size", None)
     if file_size and file_size > TELEGRAM_BOT_FILE_LIMIT:
-        await msg.reply_text(
-            f"Файл весит {file_size / 1048576:.0f} МБ — это больше лимита 2 ГБ.\n"
-            "Сожми его при отправке или пришли покороче."
-        )
+        await msg.reply_text(f"Файл весит {file_size / 1048576:.0f} МБ — это больше лимита 2 ГБ. Пришли покороче.")
         return
 
-    remember_video(update.effective_chat.id, video.file_id, file_size)
+    status = await msg.reply_text("🎬 Смотрю и слушаю ролик... Это займёт до минуты ⏳")
+    await update.effective_chat.send_action("typing")
     caption = (msg.caption or "").strip()
-    if LINK_MODE_RE.search(caption):
-        await upload_video_link(update, context, video)
-        return
-    await montage_video(update, context, video, caption)
-
-
-async def montage_video(update: Update, context: ContextTypes.DEFAULT_TYPE, video, wishes: str) -> None:
-    chat_id = update.effective_chat.id
-    logger.info("Montage start: chat=%s size=%s submagic=%s wishes=%r", chat_id,
-                getattr(video, "file_size", None), montage.submagic_enabled(), wishes[:100])
-    steps: list[str] = []
-    status = await update.message.reply_text("🎬 Принял видео — монтирую. Это займёт несколько минут.\n\n⏳ Скачиваю...")
-
-    async def step(done: str | None, now: str | None) -> None:
-        if done:
-            steps.append(f"✅ {done}")
-        text = "🎬 Монтаж\n\n" + "\n".join(steps) + (f"\n⏳ {now}" if now else "")
-        try:
-            await status.edit_text(text)
-        except BadRequest:
-            pass
 
     with tempfile.TemporaryDirectory() as tmp:
-        src = os.path.join(tmp, "source.mp4")
+        src = os.path.join(tmp, "video.mp4")
         try:
             tg_file = await context.bot.get_file(video.file_id)
             await save_telegram_file(tg_file, src)
-            info = await montage.probe(src)
-        except montage.MontageError as e:
-            await step(None, None)
-            await update.message.reply_text(f"Не получилось открыть видео: {e}")
-            return
+            duration = await social.video_duration(src)
         except Exception:
-            logger.exception("Montage download error")
-            await update.message.reply_text("Не получилось скачать видео. Попробуй отправить ещё раз.")
+            logger.exception("Video download error")
+            await status.edit_text("Не получилось скачать видео. Попробуй отправить ещё раз.")
             return
 
-        if info["duration"] > MONTAGE_MAX_SECONDS:
+        if duration > VIDEO_MAX_SECONDS:
             await status.edit_text(
-                f"Видео длится {_mmss(info['duration'])} — для Reels это слишком долго "
-                f"(монтирую до {_mmss(MONTAGE_MAX_SECONDS)}). Пришли фрагмент покороче."
+                f"Видео длится {int(duration // 60)} мин — слишком долго для разбора. Пришли фрагмент до 15 минут."
             )
             return
 
-        # 1. Расшифровка речи с таймкодами слов
-        words, transcript, lang = [], "", "ru"
-        if info["has_audio"] and openai_client is not None:
-            await step(f"Скачала ({_mmss(info['duration'])})", "Слушаю и расшифровываю речь...")
+        frames = await social.extract_frames(src)
+        transcript = ""
+        if openai_client is not None:
             try:
-                words, transcript, lang = await transcribe_words(src)
+                audio = await extract_audio_mp3_from_path(src)
+                if audio:
+                    transcript = await transcribe(audio, "audio.mp3")
             except Exception:
-                logger.exception("Montage transcription error")
-        else:
-            await step(f"Скачала ({_mmss(info['duration'])})", None)
+                logger.exception("Video transcription error")
 
-        # 2. Продюсерский план
-        await step("Расшифровала речь" if transcript else "Речи нет — монтирую по картинке", "Продюсирую: хук, темп, подпись к посту...")
-        plan = await make_montage_plan(transcript, wishes)
-
-        # 3. Монтаж: Submagic → запасной свой
-        result = os.path.join(tmp, "final.mp4")
-        engine = None
-        fallback_note = ""
-        if montage.submagic_enabled():
-            await step("Продумала хук и подпись", "Монтирую в Submagic: субтитры, наезды, паузы (обычно 2–5 минут)...")
-
-            async def on_progress(s):
-                labels = {"processing": "обрабатывает", "transcribing": "расшифровывает", "exporting": "рендерит видео"}
-                if s in labels:
-                    await step(None, f"Submagic {labels[s]}...")
-            try:
-                url = await montage.submagic_edit(src, lang, plan, plan.hook_title or "Reels", on_progress=on_progress)
-                await montage.download_file(url, result)
-                engine = "Submagic"
-            except Exception as e:
-                logger.exception("Submagic error")
-                fallback_note = f"Submagic не сработал ({e}) — смонтировала сама."
-                await step(None, "Submagic не сработал — монтирую сама...")
-        else:
-            await step("Продумала хук и подпись", "Монтирую: режу паузы, ставлю субтитры и наезды...")
-
-        stats = None
-        if engine is None:
-            try:
-                stats = await montage.ffmpeg_edit(src, result, words, plan, tmp)
-                engine = "ffmpeg"
-            except montage.MontageError as e:
-                await step(None, None)
-                await update.message.reply_text(f"Не получилось смонтировать: {e}")
-                return
-            except Exception:
-                logger.exception("ffmpeg montage error")
-                await update.message.reply_text("Не получилось смонтировать видео. Попробуй ещё раз.")
-                return
-
-        await step("Смонтировала", "Отправляю видео...")
-        try:
-            final_info = await montage.probe(result)
-        except Exception:
-            final_info = {"duration": 0}
-
-        if stats:
-            summary = (
-                f"✂️ Было {_mmss(stats['original'])} → стало {_mmss(stats['final'])}, "
-                f"вырезала пауз: {stats['cuts']}"
-            )
-        else:
-            summary = f"✂️ Смонтировано в Submagic · {_mmss(final_info.get('duration', 0))}"
-        if fallback_note:
-            summary += f"\n⚠️ {fallback_note}"
-
-        await update.effective_chat.send_action("upload_video")
-        try:
-            with open(result, "rb") as f:
-                await update.message.reply_video(
-                    video=f,
-                    caption=summary[:1000],
-                    supports_streaming=True,
-                    width=1080,
-                    height=1920,
-                    duration=int(final_info.get("duration") or 0) or None,
-                    read_timeout=600,
-                    write_timeout=600,
-                )
-        except Exception:
-            logger.exception("Send video error")
-            await update.message.reply_text("Видео смонтировано, но не получилось отправить его в Telegram. Попробуй ещё раз.")
-            return
+    if not frames and not transcript:
+        await status.edit_text("Не получилось разобрать видео — возможно, файл повреждён. Попробуй другой.")
+        return
 
     try:
-        await status.delete()
-    except Exception:
+        await status.edit_text("✅ Посмотрела ролик. Разбираю как продюсер...")
+    except BadRequest:
         pass
 
-    parts = []
-    if plan.comment:
-        parts.append(f"**Комментарий продюсера:** {plan.comment}")
-    if plan.hook_title:
-        parts.append(f"**Хук на экране:** {plan.hook_title}")
-    if plan.post_caption:
-        parts.append(f"**Подпись к посту:**\n\n{plan.post_caption}")
-    text = "\n\n".join(parts)
-    if text:
-        await send_long(update, text)
+    summary_lines = [f"[Видео от Анны · {duration:.0f} сек]"]
+    summary_lines.append(
+        f"Расшифровка речи:\n{transcript[:6000]}" if transcript
+        else "Речи в видео нет (или не распознана) — смысл передаётся картинкой и текстом на экране."
+    )
+    if frames:
+        summary_lines.append(f"Ниже — {len(frames)} кадров из видео по порядку (первый — начало ролика, хук).")
+    summary = "\n".join(summary_lines)
 
-    note = "[Прислала видео на монтаж]" + (f" Пожелания: {wishes}" if wishes else "")
-    if transcript:
-        note += f"\nРасшифровка ролика: {transcript[:4000]}"
-    await remember(chat_id, note, text or "[Смонтировала видео]")
+    content: list[dict] = [{"type": "text", "text": summary}]
+    content += [social.image_block(fr) for fr in frames]
+    content.append({"type": "text", "text": caption or VIDEO_REVIEW_PROMPT})
+
+    note = summary[:6000] + (f"\n\n{caption}" if caption else "\n\n[Разбери моё видео]")
+    await ask_claude(update, update.effective_chat.id, content, history_note=note)
+
+
+async def extract_audio_mp3_from_path(path: str) -> bytes | None:
+    """Звук из видео в лёгкий mp3 для Whisper — прямо с диска, без загрузки видео в память."""
+    dst = path + ".mp3"
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-threads", "2", "-i", path, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", dst,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0 or not os.path.exists(dst):
+        logger.info("В видео нет звука или ffmpeg не смог его достать: %s", stderr.decode(errors="ignore")[-300:])
+        return None
+    with open(dst, "rb") as f:
+        return f.read()
 
 
 # ---------------------------------------------------------------------------
