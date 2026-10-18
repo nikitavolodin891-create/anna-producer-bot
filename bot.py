@@ -19,7 +19,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import anthropic
 from openai import AsyncOpenAI
 
-from prompt import SYSTEM_PROMPT as ANNA_PROMPT, LINK_ANALYSIS_PROMPT, VIDEO_REVIEW_PROMPT, AUDIT_PROMPT, TRENDS_PROMPT, EDITOR_PROMPT
+from prompt import SYSTEM_PROMPT as ANNA_PROMPT, LINK_ANALYSIS_PROMPT, VIDEO_REVIEW_PROMPT, AUDIT_PROMPT, TRENDS_PROMPT, EDITOR_PROMPT, SCRIPT_FORMAT_NOTE
 import social
 import audit
 import trends
@@ -658,6 +658,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await process_user_text(update, update.message.text)
 
 
+SCRIPT_INTENT_RE = re.compile(r"(сценари|рилс|reels|хук|ролик|подпис\w*\s+к\s+пост|что\s+снять|идеи\s+для\s+(видео|контента))", re.I)
+
+
 async def process_user_text(update: Update, user_text: str) -> None:
     """Общая обработка текста — и набранного, и распознанного из голосового/кружка."""
     chat_id = update.effective_chat.id
@@ -674,6 +677,10 @@ async def process_user_text(update: Update, user_text: str) -> None:
             return
         if AUDIT_INTENT_RE.search(user_text):
             await run_audit(update, audit.CLIENT_INSTAGRAM, extra=user_text)
+            return
+        if SCRIPT_INTENT_RE.search(user_text):
+            # формат-требования видит только модель; в историю идёт чистый текст Анны
+            await ask_claude(update, chat_id, user_text + SCRIPT_FORMAT_NOTE, history_note=user_text, max_tokens=8000)
             return
         await ask_claude(update, chat_id, user_text)
         return
