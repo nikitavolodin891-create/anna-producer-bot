@@ -27,6 +27,31 @@ STOP = {
 }
 
 
+# Противопоставления «не X, а Y» во всех формах
+CONTRAST_PATTERNS = [
+    re.compile(r"\bне\s+потому,?\s+что\b", re.I),                          # «Не потому что… (а/просто)…»
+    re.compile(r"\bне\b[^.!?\n]{1,70}?[,—–-]\s*а\s", re.I),                   # «не X, а Y» / «не X — а Y»
+    re.compile(r"(?:^|[.!?»]\s+)не\s[^.!?\n]{1,50}?\s[—–]\s(?!а\s)[а-яё]", re.I),  # «Не как проект — как партнёр»
+    re.compile(r"\b(это|дело|проблема|потолок|сила)\s+не\s+(в|про|о|об)\b[^.!?\n]{0,60}[.!?]\s*(это|а|дело|он|она|потолок|сила)?\s*(в|про)\b", re.I),
+]
+MAX_CONTRASTS = 2
+
+
+def find_contrasts(text: str) -> list[str]:
+    """Предложения с противопоставлением, по порядку."""
+    out: list[str] = []
+    NEG = re.compile(r"(^|\s)не\s", re.I)
+    NEXT = re.compile(r"^(а\s|это\s+(про|в|о)\b|просто\s)", re.I)
+    for para in re.split(r"\n{2,}", _strip_placeholders(text)):
+        sents = [x.strip() for x in SENT_SPLIT.split(para.replace("\n", " ")) if x.strip()]
+        for i, s in enumerate(sents):
+            if any(p.search(s) for p in CONTRAST_PATTERNS):
+                out.append(s)
+            elif i + 1 < len(sents) and NEG.search(s) and NEXT.search(sents[i + 1]):
+                out.append(f"{s} {sents[i + 1]}")  # «Не X. А Y.» / «Это не про X. Это про Y.»
+    return out
+
+
 def _strip_placeholders(text: str) -> str:
     return re.sub(r"\[[^\]]*\]", " ", text)
 
@@ -71,10 +96,16 @@ def find_issues(text: str, facts_text: str = "") -> list[str]:
                 if n >= 3:
                     issues.append(f"ПОВТОР («{root}…» {n} раза в одном абзаце): «{clean[:220]}»")
                     break
+    # 3. Противопоставлений больше двух на весь ответ — лишние на переписывание
+    contrasts = find_contrasts(text)
+    if len(contrasts) > MAX_CONTRASTS:
+        for c in contrasts[MAX_CONTRASTS:]:
+            issues.append(f"ЛИШНЕЕ ПРОТИВОПОСТАВЛЕНИЕ (их {len(contrasts)}, допустимо {MAX_CONTRASTS}) — перепиши прямо, без «не…, а…»: «{c[:200]}»")
+
     # без дублей, не больше 12 — чтобы фиксер работал точечно
     seen, out = set(), []
     for i in issues:
         if i not in seen:
             seen.add(i)
             out.append(i)
-    return out[:12]
+    return out[:14]

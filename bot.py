@@ -19,12 +19,15 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import anthropic
 from openai import AsyncOpenAI
 
-from prompt import SYSTEM_PROMPT as ANNA_PROMPT, LINK_ANALYSIS_PROMPT, VIDEO_REVIEW_PROMPT, AUDIT_PROMPT, TRENDS_PROMPT, EDITOR_PROMPT, SCRIPT_FORMAT_NOTE, FIXER_PROMPT
+from prompt import SYSTEM_PROMPT as ANNA_PROMPT, LINK_ANALYSIS_PROMPT, VIDEO_REVIEW_PROMPT, AUDIT_PROMPT, TRENDS_PROMPT, EDITOR_PROMPT, SCRIPT_FORMAT_NOTE, FIXER_PROMPT, CAROUSEL_PROMPT, WEB_SEARCH_NOTE
 import social
 import audit
 import trends
 import facts
 import lint
+import carousel
+import datetime
+from telegram import InputMediaPhoto, InputMediaDocument
 
 logging.basicConfig(level=logging.INFO)
 # httpx пишет в лог каждый запрос к Telegram вместе с токеном бота в URL — глушим
@@ -36,6 +39,9 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # нужен для распознавания голосовых и кружков
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 CLAUDE_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "4000"))
+# Поиск в интернете (встроенный инструмент Claude): $10 за 1000 поисков + токены результатов.
+WEB_SEARCH_ENABLED = os.environ.get("WEB_SEARCH_ENABLED", "1") != "0"
+WEB_SEARCH_MAX_USES = int(os.environ.get("WEB_SEARCH_MAX_USES", "5"))
 
 # Кому разрешено пользоваться ботом: Telegram user ID через запятую.
 # Пусто — бот открыт всем (так было раньше). Узнать свой ID: команда /id.
@@ -216,12 +222,75 @@ async def send_long(update: Update, text: str) -> None:
 # ---------------------------------------------------------------------------
 # Общение с Claude
 # ---------------------------------------------------------------------------
+def _web_search_tool() -> dict:
+    return {"type": "web_search_20250305", "name": "web_search", "max_uses": WEB_SEARCH_MAX_USES}
+
+
+async def _create(system: str, messages: list[dict], max_tokens: int, web_search: bool):
+    """Запрос к Claude с (необязательным) поиском в интернете.
+
+    Возвращает (текст, stop_reason, источники). Поиск идёт на стороне Anthropic: модель сама решает,
+    искать или нет. Долгий поиск API может поставить на паузу (pause_turn) — тогда продолжаем.
+    Если поиск выключен в организации Anthropic (400), повторяем запрос без него.
+    """
+    kwargs = {"model": CLAUDE_MODEL, "max_tokens": max_tokens, "system": system}
+    use_search = web_search and WEB_SEARCH_ENABLED
+    msgs = list(messages)
+    texts: list[str] = []
+    sources: dict[str, str] = {}
+    for _ in range(4):
+        try:
+            if use_search:
+                response = await client.messages.create(messages=msgs, tools=[_web_search_tool()], **kwargs)
+            else:
+                response = await client.messages.create(messages=msgs, **kwargs)
+        except anthropic.BadRequestError as e:
+            if use_search and "web" in str(e).lower() and "search" in str(e).lower():
+                logger.warning("Web search недоступен, отвечаю без него: %s", e)
+                use_search = False
+                continue
+            raise
+        for block in response.content:
+            if block.type == "text":
+                texts.append(block.text)
+                for c in getattr(block, "citations", None) or []:
+                    url = getattr(c, "url", None)
+                    if url and url not in sources and len(sources) < 6:
+                        sources[url] = (getattr(c, "title", None) or url).strip()
+        if response.stop_reason != "pause_turn":
+            break
+        # продолжение: отдаём паузнутый ответ ассистента обратно как есть
+        msgs = msgs + [{"role": "assistant", "content": [b.model_dump(exclude_none=True) for b in response.content]}]
+    return "".join(texts), response.stop_reason, sources
+
+
+def _with_sources(text: str, sources: dict[str, str]) -> str:
+    if not sources:
+        return text
+    missing = {u: t for u, t in sources.items() if u not in text}
+    if not missing:
+        return text
+    lines = [f"• {t[:80]} — {u}" for u, t in list(missing.items())[:5]]
+    return text.rstrip() + "\n\n**Источники:**\n" + "\n".join(lines)
+
+
+def system_with_search() -> str:
+    months = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа",
+              "сентября", "октября", "ноября", "декабря"]
+    d = datetime.date.today()
+    return current_system_prompt() + WEB_SEARCH_NOTE.format(today=f"{d.day} {months[d.month - 1]} {d.year}")
+
+
 async def ask_claude(
     update: Update,
     chat_id: int,
     content: str | list[dict],
     history_note: str | None = None,
     max_tokens: int | None = None,
+    web_search: bool = False,
+    send: bool = True,
+    edit: bool = True,
+    history_reply=None,
 ) -> str | None:
     """Единая точка общения с Claude. Возвращает полный ответ (или None при ошибке).
 
@@ -242,14 +311,11 @@ async def ask_claude(
         await update.effective_chat.send_action("typing")
         typing_task = asyncio.create_task(_keep_typing(update))
         try:
-            response = await client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=max_tokens or CLAUDE_MAX_TOKENS,
-                system=current_system_prompt(),
-                messages=messages,
+            system = system_with_search() if (web_search and WEB_SEARCH_ENABLED) else current_system_prompt()
+            reply_text, stop_reason, sources = await _create(
+                system, messages, max_tokens or CLAUDE_MAX_TOKENS, web_search
             )
-            reply_text = "".join(block.text for block in response.content if block.type == "text")
-            if response.stop_reason != "max_tokens" and needs_editing(reply_text):
+            if edit and stop_reason != "max_tokens" and needs_editing(reply_text):
                 reply_text = await edit_draft(reply_text, max_tokens or CLAUDE_MAX_TOKENS)
         except anthropic.APIStatusError as e:
             logger.exception("Anthropic API error")
@@ -270,18 +336,27 @@ async def ask_claude(
 
         full_reply = reply_text
         reply_text = MEMORY_RE.sub("", reply_text).strip()  # служебный блок памяти пользователю не показываем
+        if send:
+            reply_text = _with_sources(reply_text, sources)
 
-        if response.stop_reason == "max_tokens":
+        if stop_reason == "max_tokens" and send:
             reply_text += "\n\n_(ответ обрезан по длине — напиши «продолжи», и я допишу)_"
 
+        stored = reply_text
+        if history_reply:
+            try:
+                stored = history_reply(reply_text)
+            except Exception:
+                pass
         history = history + [
             {"role": "user", "content": note},
-            {"role": "assistant", "content": reply_text},
+            {"role": "assistant", "content": stored},
         ]
         conversations[chat_id] = _sanitize_history(history[-MAX_HISTORY_MESSAGES:])
         _save_conversations()
 
-    await send_long(update, reply_text)
+    if send:
+        await send_long(update, reply_text)
     return full_reply
 
 
@@ -416,10 +491,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Понимаю голосовые и кружки 🎙\n"
         "• Разбираю рилсы и посты по ссылке (Instagram, TikTok, YouTube)\n"
         "• Читаю фото, PDF и сайты\n"
+        "• Делаю карусели — готовые картинки-слайды + подпись 🖼\n"
+        "• Ищу в интернете свежее: цены, адреса, новости 🔎\n"
         "• Разбираю твои видео: пришли ролик — скажу, что с хуком и что улучшить 🎬\n\n"
         "Просто напиши или наговори, что нужно.\n"
         "/trends — что сейчас залетает в нише + 15 хуков для тебя\n"
         "/audit — аудит твоего Инстаграма (или /audit @ник — любого аккаунта)\n"
+        "/carousel тема — карусель-картинки для Instagram\n"
         "/competitors — аккаунты-ориентиры для трендов\n"
         "/memory — что я о тебе помню (добавить: «Запомни: …»)\n"
         "/new — начать новый диалог (забыть контекст)"
@@ -701,6 +779,10 @@ async def process_user_text(update: Update, user_text: str) -> None:
         await remember_fact(update, to_remember)
         return
 
+    if not urls and CAROUSEL_INTENT_RE.search(user_text):
+        await run_carousel(update, user_text)
+        return
+
     if not urls:
         if TRENDS_INTENT_RE.search(user_text):
             await run_trends(update, topic=user_text)
@@ -710,9 +792,10 @@ async def process_user_text(update: Update, user_text: str) -> None:
             return
         if SCRIPT_INTENT_RE.search(user_text):
             # формат-требования видит только модель; в историю идёт чистый текст Анны
-            await ask_claude(update, chat_id, user_text + SCRIPT_FORMAT_NOTE, history_note=user_text, max_tokens=8000)
+            await ask_claude(update, chat_id, user_text + SCRIPT_FORMAT_NOTE, history_note=user_text,
+                             max_tokens=8000, web_search=True)
             return
-        await ask_claude(update, chat_id, user_text)
+        await ask_claude(update, chat_id, user_text, web_search=True)
         return
 
     # Ссылка на профиль Instagram — аудит аккаунта
@@ -754,6 +837,71 @@ async def process_user_text(update: Update, user_text: str) -> None:
 
     content_blocks.append({"type": "text", "text": user_text})
     await ask_claude(update, chat_id, content_blocks, history_note=" ".join(notes + [user_text]))
+
+
+# ---------------------------------------------------------------------------
+# Карусели
+# ---------------------------------------------------------------------------
+CAROUSEL_INTENT_RE = re.compile(r"(карусел|слайд)", re.I)
+
+
+async def carousel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    topic = " ".join(context.args or []).strip()
+    if not topic:
+        await update.message.reply_text(
+            "Напиши тему или свой текст, например:\n"
+            "/carousel 5 причин, почему деньги уходят быстрее, чем приходят\n\n"
+            "Можно и без команды: «сделай карусель про …». Оформление: светлое по умолчанию, "
+            "можно попросить «тёмную» или «розовую». Поправить: «в карусели поменяй слайд 3 …»."
+        )
+        return
+    await run_carousel(update, "Сделай карусель: " + topic)
+
+
+def _carousel_history(reply: str) -> str:
+    try:
+        return "[Карусель]\n" + carousel.as_text(carousel.parse(reply))
+    except Exception:
+        return reply
+
+
+async def run_carousel(update: Update, user_text: str) -> None:
+    """Тексты слайдов пишет Claude (JSON), картинки рисует carousel.py, шлём альбомом + подпись."""
+    chat_id = update.effective_chat.id
+    status = await update.effective_message.reply_text("🎨 Пишу тексты слайдов и рисую карусель… ⏳")
+    reply = await ask_claude(
+        update, chat_id, user_text + "\n\n" + CAROUSEL_PROMPT, history_note=user_text,
+        max_tokens=6000, web_search=True, send=False, edit=False, history_reply=_carousel_history,
+    )
+    if reply is None:
+        return
+    try:
+        data = carousel.parse(reply)
+        theme = carousel.pick_theme(user_text)
+        images = await asyncio.to_thread(carousel.render, data, theme)
+    except Exception as e:
+        logger.exception("Carousel error")
+        await status.edit_text(f"Не получилось собрать карусель ({e}). Попробуй ещё раз или переформулируй.")
+        return
+    try:
+        await status.delete()
+    except Exception:
+        pass
+    n = len(images)
+    await update.effective_message.reply_media_group(
+        [InputMediaPhoto(img) for img in images]
+    )
+    # те же слайды файлами — без сжатия Telegram, для загрузки в Instagram в полном качестве
+    await update.effective_message.reply_media_group(
+        [InputMediaDocument(img, filename=f"slide_{i:02d}.png") for i, img in enumerate(images, 1)]
+    )
+    text = carousel.as_text(data)
+    await send_long(
+        update,
+        f"✅ Карусель готова: {n} слайдов (сверху — превью, ниже — файлы в полном качестве для Instagram).\n\n"
+        + text
+        + "\n\n_Поправить: «в карусели поменяй слайд 3 на …», «сделай тёмную/розовую», «сократи текст»._",
+    )
 
 
 PLATFORM_NAMES = {"instagram": "Инстаграм", "tiktok": "TikTok", "youtube": "YouTube"}
@@ -1149,6 +1297,7 @@ def main() -> None:
     app.add_handler(CommandHandler("audit", guarded(audit_command)))
     app.add_handler(CommandHandler(["trends", "hooks"], guarded(trends_command)))
     app.add_handler(CommandHandler("competitors", guarded(competitors_command)))
+    app.add_handler(CommandHandler(["carousel", "karusel"], guarded(carousel_command)))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, guarded(handle_video)))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE, guarded(handle_voice)))
     app.add_handler(MessageHandler(filters.PHOTO, guarded(handle_photo)))
