@@ -520,7 +520,7 @@ def build_background(d: dict, role: str, idx: int, photo=None, ai_bg=None) -> Im
         # фото на слайде: снизу тёмный градиент под текст (на внутренних слайдах — плотнее)
         im = _cover_crop(photo)
         a = np.asarray(im).astype(np.float32)
-        start = 0.25 if role == "cover" else 0.12
+        start = 0.25 if role == "cover" else 0.22
         grad = np.clip((_YY / H - start) / (1 - start), 0, 1)[..., None] ** 1.2
         k = 0.78 if role == "cover" else 0.86
         a = a * (1 - grad * k) + _hex("#0E0A0A") * grad * k
@@ -923,7 +923,7 @@ def render_slide(slide: dict, idx: int, total: int, d: dict, photo=None, ai_bg=N
     if role == "cover" and "monogram" in orn:
         top_lim = 300
     if photo_cover:
-        top_lim = int(H * (0.42 if role == "cover" else 0.30))
+        top_lim = int(H * (0.42 if role == "cover" else 0.46))
 
     ill = None if photo_cover else _illustration_for(d, role)
     ill_img, ill_pos = None, None
@@ -1072,7 +1072,29 @@ def render(data: dict, design: dict | None = None, photo: bytes | None = None, a
     per += [None] * (total - len(per))
     if photo and not per[0]:
         per[0] = photo
-    opened = [Image.open(io.BytesIO(b)) if b else None for b in per]
+    opened = []
+    for i, b in enumerate(per):
+        if not b:
+            opened.append(None)
+            continue
+        rep = 0
+        if isinstance(b, tuple):
+            b, rep = b
+        im = Image.open(io.BytesIO(b))
+        try:
+            im = ImageOps.exif_transpose(im)
+        except Exception:
+            pass
+        if rep:
+            # повтор того же фото — другой кадр: крупнее и со смещением, чтобы слайды не были одинаковыми
+            z = min(1.0 + 0.16 * rep, 1.45)
+            cw, ch = int(im.width / z), int(im.height / z)
+            fx = [0.5, 0.25, 0.75, 0.4, 0.6][rep % 5]
+            fy = [0.1, 0.0, 0.15, 0.05, 0.2][rep % 5]
+            x0 = int((im.width - cw) * fx)
+            y0 = int((im.height - ch) * fy)
+            im = im.crop((x0, y0, x0 + cw, y0 + ch))
+        opened.append(im)
     ai = Image.open(io.BytesIO(ai_bg)) if ai_bg else None
     return [render_slide(s, i, total, d, opened[i - 1], ai) for i, s in enumerate(data["slides"], 1)]
 

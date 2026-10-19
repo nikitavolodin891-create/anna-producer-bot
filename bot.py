@@ -967,24 +967,38 @@ def _preview_jpeg(data: bytes, side: int = 900) -> bytes:
 
 
 def _assign_photos(raw: dict, photos: list[bytes], n_slides: int) -> list:
-    """Какое фото на какой слайд: из design.slide_photos (номера с 1) или старое photo_use=cover."""
-    per = [None] * n_slides
+    """Фото по слайдам. Claude выбирает номера в design.slide_photos; пустые слайды добиваем выбранными
+    фото по кругу (с другой кадровкой), чтобы карусель не была «одна обложка и голый текст»."""
+    per: list = [None] * n_slides
     if not photos or raw.get("photo_use") == "reference":
         return per
+    chosen: list[int] = []
     sp = raw.get("slide_photos")
-    if isinstance(sp, list) and sp:
-        used = set()
+    if isinstance(sp, list):
         for i, v in enumerate(sp[:n_slides]):
             try:
                 k = int(v)
             except (TypeError, ValueError):
                 continue
-            if 1 <= k <= len(photos) and k not in used:
-                per[i] = photos[k - 1]
-                used.add(k)
-    elif raw.get("photo_use") == "cover" or (len(photos) == 1 and raw.get("photo_use") != "reference"):
-        per[0] = photos[0]
-    return per
+            if 1 <= k <= len(photos):
+                per[i] = k
+                if k not in chosen:
+                    chosen.append(k)
+    pool = chosen or list(range(1, len(photos) + 1))
+    if per[0] is None:
+        per[0] = pool[0]
+    j = 0
+    for i in range(n_slides):
+        if per[i] is None:
+            per[i] = pool[(j + (1 if len(pool) > 1 else 0)) % len(pool)]
+            j += 1
+    seen: dict = {}
+    out = []
+    for k in per:
+        rep = seen.get(k, 0)
+        seen[k] = rep + 1
+        out.append((photos[k - 1], rep))   # rep>0 — то же фото, но другой кадр
+    return out
 
 
 async def fetch_insta_photos(limit: int = 12) -> tuple[list[bytes], str]:
@@ -1047,6 +1061,7 @@ async def run_carousel(update: Update, user_text: str, image: bytes | None = Non
         except Exception:
             pass
         insta, err = await fetch_insta_photos()
+        logger.info("Insta photos fetched: %d (%s)", len(insta), err or "ok")
         if insta:
             photos += insta
             from_insta = True
@@ -1096,6 +1111,12 @@ async def run_carousel(update: Update, user_text: str, image: bytes | None = Non
         raw = data.get("design") or {}
         d = carousel.resolve(raw, saved=design_store.saved(DATA_DIR))
         slide_photos = _assign_photos(raw, photos, len(data["slides"]))
+        n_used = sum(1 for x in slide_photos if x)
+        logger.info("Carousel: %d slides, photos given=%d (insta=%s), chosen=%s, on slides=%d",
+                    len(data["slides"]), len(photos), from_insta, raw.get("slide_photos"), n_used)
+        if photos:
+            src = f"взяла {len(photos)} фото из Instagram" if from_insta and len(photos) == len(insta) else f"фото: {len(photos)}"
+            warn += f"\n📸 {src}, поставила на {n_used} из {len(data['slides'])} слайдов."
         ai_bg = None
         if d["background"].get("type") == "ai":
             try:
