@@ -496,7 +496,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Делаю карусели — готовые картинки-слайды + подпись 🖼 Дизайн опиши словами, пришли скрин-пример или своё фото для обложки\n"
         "• Ищу в интернете свежее: цены, адреса, новости 🔎\n"
         "• Разбираю твои видео: пришли ролик — скажу, что с хуком и что улучшить 🎬\n\n"
-        "Просто напиши или наговори, что нужно.\n"
+        "Просто напиши или наговори, что нужно. Полный список с примерами — /help\n"
         "/trends — что сейчас залетает в нише + 15 хуков для тебя\n"
         "/audit — аудит твоего Инстаграма (или /audit @ник — любого аккаунта)\n"
         "/carousel тема — карусель-картинки для Instagram (дизайн — любыми словами или по скрину)\n"
@@ -505,6 +505,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/memory — что я о тебе помню (добавить: «Запомни: …»)\n"
         "/new — начать новый диалог (забыть контекст)"
     )
+
+
+HELP_TEXT = (
+    "✨ <b>Что я умею</b>\n\n"
+    "<b>Карусели</b>\n"
+    "• «сделай карусель про …» или /carousel тема\n"
+    "• Из своих фото: выдели несколько фото, отправь одним сообщением и подпиши «сделай из этого карусель про …»\n"
+    "• С фото из Instagram: «сделай карусель про …, возьми фото из моей инсты»\n"
+    "• Дизайн словами: «в стиле old money», «бордовый с золотом», «как море»\n"
+    "• Готовые стили: /designs · по примеру: скрин чужой карусели + «в таком стиле»\n"
+    "• Рисунок: «сверху нарисуй пальму» · нейрофон: «с нейрофоном: вилла на закате»\n"
+    "• Понравилось — «запомни дизайн как мой стиль», потом «карусель в дизайне мой стиль»\n"
+    "• Правки: «поменяй слайд 3 на …», «перерисуй темнее»\n\n"
+    "<b>Instagram</b>\n"
+    "• /audit — аудит твоего аккаунта, /audit @ник — любого открытого\n"
+    "• Ссылка на рилс или пост — разберу, почему залетел\n"
+    "• /trends — что сейчас залетает в нише + хуки, /competitors — ориентиры\n"
+    "• Скрин статистики (охваты, досмотры) — разберу цифры\n\n"
+    "<b>Тексты и идеи</b>\n"
+    "• Сценарии рилс, хуки, подписи в твоём голосе, проверка и правка текстов\n"
+    "• «Запомни: …» — запомню факт или историю, /memory — что я помню\n\n"
+    "<b>Ещё</b>\n"
+    "• Голосовые и кружки 🎙 · видео-разбор: пришли ролик 🎬\n"
+    "• Поиск в интернете: цены, адреса, новости 🔎 · фото, PDF, сайты\n"
+    "• /new — начать диалог заново"
+)
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
 
 
 async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1051,7 +1081,18 @@ async def run_carousel(update: Update, user_text: str, image: bytes | None = Non
         return
     warn = ""
     try:
-        data = carousel.parse(reply)
+        try:
+            data = carousel.parse(reply)
+        except carousel.CarouselError:
+            # кривой JSON (обрезан, лишний текст, сломан SVG) — просим Claude починить, без истории
+            logger.warning("Carousel JSON broken, asking Claude to repair")
+            fixed, _, _ = await _create(
+                "Ты чинишь JSON. Верни ТОЛЬКО валидный JSON без пояснений.",
+                [{"role": "user", "content": "Исправь и верни валидный JSON карусели в том же формате "
+                  "({\"slides\": [...], \"caption\": \"...\", \"design\": {...}}). Если в design есть "
+                  "illustration и она сломана — просто убери её. Вот ответ:\n\n" + reply[:60000]}],
+                9000, False)
+            data = carousel.parse(fixed)
         raw = data.get("design") or {}
         d = carousel.resolve(raw, saved=design_store.saved(DATA_DIR))
         slide_photos = _assign_photos(raw, photos, len(data["slides"]))
@@ -1064,10 +1105,17 @@ async def run_carousel(update: Update, user_text: str, image: bytes | None = Non
             ai_bg, err = await generate_ai_background(str(raw.get("ai_prompt") or d.get("ai_prompt") or user_text))
             if ai_bg is None:
                 warn = f"\n\n⚠️ Нейрофон не получился ({err[:200]}) — нарисовала без него."
-        images = await asyncio.to_thread(carousel.render, data, d, None, ai_bg, slide_photos)
+        try:
+            images = await asyncio.to_thread(carousel.render, data, d, None, ai_bg, slide_photos)
+        except Exception:
+            # дизайн не отрисовался — не подводим: рисуем те же тексты и фото в базовом стиле
+            logger.exception("Carousel render failed, falling back to the default design")
+            d = carousel.resolve({"preset": carousel.DEFAULT_PRESET})
+            images = await asyncio.to_thread(carousel.render, data, d, None, None, slide_photos)
+            warn += "\n\n⚠️ Выбранный дизайн не отрисовался, сделала в базовом стиле. Попроси другой стиль, если нужно."
     except Exception as e:
         logger.exception("Carousel error")
-        await status.edit_text(f"Не получилось собрать карусель ({e}). Попробуй ещё раз или переформулируй.")
+        await status.edit_text("Не получилось собрать карусель — попробуй ещё раз через минуту или переформулируй запрос 🙏")
         return
     design_store.set_last(DATA_DIR, chat_id, carousel.public(d))
     try:
@@ -1612,6 +1660,7 @@ def main() -> None:
     app.add_handler(CommandHandler("id", show_id))
     app.add_handler(CommandHandler("start", guarded(start)))
     app.add_handler(CommandHandler("new", guarded(new_dialog)))
+    app.add_handler(CommandHandler("help", guarded(help_command)))
     app.add_handler(CommandHandler("memory", guarded(memory_command)))
     app.add_handler(CommandHandler("forget", guarded(forget_command)))
     app.add_handler(CommandHandler("audit", guarded(audit_command)))
