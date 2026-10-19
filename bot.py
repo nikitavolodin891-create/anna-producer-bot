@@ -815,7 +815,8 @@ async def process_user_text(update: Update, user_text: str) -> None:
         await remember_fact(update, to_remember)
         return
 
-    if not urls and CAROUSEL_INTENT_RE.search(user_text):
+    if not urls and (CAROUSEL_INTENT_RE.search(user_text)
+                     or (AI_ART_RE.search(user_text) and recent_photos(update.effective_chat.id))):
         await run_carousel(update, user_text)
         return
 
@@ -945,6 +946,83 @@ async def generate_ai_background(prompt: str) -> tuple[bytes | None, str]:
 
 
 MAX_CAROUSEL_PHOTOS = 14
+# подпись к фото, по которой делаем карусель/креатив (а не просто комментируем фото)
+PHOTO_CAROUSEL_RE = re.compile(
+    r"(карусел|слайд|креатив|криатив|постик|\bпост\b|оформ|обложк|нарису|сгенерир|нейро|"
+    r"сделай[^.!?\n]{0,30}(из|с|по)\s+(этого|этих|этой|эт[ои]м|фото|фотк|снимк))", re.I)
+# в тексте есть отсылка к уже присланным фото
+REFERS_PHOTO_RE = re.compile(r"(фото|фотк|снимк|из этого|по этому|скинул|прислал|отправил|\bменя\b)", re.I)
+# просят ИИ-картинку человека по фото (а не векторный рисунок)
+AI_ART_RE = re.compile(
+    r"(ии[- ]?(картин|арт|верси|фото|изображ)|ai[- ]?(art|арт)|нейро[- ]?(картин|арт|фото|портрет)|"
+    r"сгенерир\w*\s+(меня|её|ее|фото|картин|портрет)|нарису\w*\s+(меня|её|ее|анну|по фото|мой|мою)|"
+    r"в стиле\s+(аниме|акварел|мульт|комикс|масл|живопис|картин|арт))", re.I)
+RECENT_PHOTOS_TTL = 2 * 3600
+_recent_photos: dict = {}
+
+
+def remember_photos(chat_id: int, photos: list[bytes]) -> None:
+    import time as _t
+    if photos:
+        _recent_photos[chat_id] = {"t": _t.time(), "photos": list(photos)[:MAX_CAROUSEL_PHOTOS]}
+
+
+def recent_photos(chat_id: int) -> list[bytes]:
+    import time as _t
+    r = _recent_photos.get(chat_id)
+    if r and _t.time() - r["t"] < RECENT_PHOTOS_TTL:
+        return list(r["photos"])
+    return []
+
+
+AI_ART_SUFFIX = (
+    " Keep the woman's face, identity, hair colour and features recognisably the same as in the reference photo. "
+    "Vertical 4:5 composition, leave calm space in the lower third for overlay text. No text, no letters, no logos."
+)
+
+
+async def generate_ai_portraits(photo: bytes, prompt: str, count: int = 1) -> tuple[list[bytes], str]:
+    """ИИ-картинки по фото Анны (OpenAI images.edit). Возвращает (картинки, причина_ошибки)."""
+    if openai_client is None:
+        return [], "нет ключа OpenAI"
+    from PIL import Image as _Image, ImageOps as _ImageOps
+    im = _Image.open(io.BytesIO(photo))
+    try:
+        im = _ImageOps.exif_transpose(im)
+    except Exception:
+        pass
+    im = im.convert("RGB")
+    im.thumbnail((1536, 1536))
+    buf = io.BytesIO()
+    im.save(buf, "PNG")
+    png = buf.getvalue()
+    full = prompt.strip()[:900] + AI_ART_SUFFIX
+
+    async def one(i: int):
+        r = await asyncio.wait_for(openai_client.images.edit(
+            model=IMAGE_MODEL, image=(f"anna_{i}.png", png, "image/png"), prompt=full, size="1024x1536", n=1),
+            timeout=180)
+        item = r.data[0]
+        if getattr(item, "b64_json", None):
+            return base64.b64decode(item.b64_json)
+        if getattr(item, "url", None):
+            async with httpx.AsyncClient(timeout=60) as h:
+                resp = await h.get(item.url)
+                resp.raise_for_status()
+                return resp.content
+        raise RuntimeError("пустой ответ")
+
+    results = await asyncio.gather(*(one(i) for i in range(max(1, min(count, 3)))), return_exceptions=True)
+    out = [x for x in results if isinstance(x, (bytes, bytearray))]
+    errs = [str(x)[:150] for x in results if isinstance(x, Exception)]
+    for e in errs:
+        logger.warning("AI portrait failed: %s", e)
+    return out, ("; ".join(errs) if not out else "")
+
+
+# признаки того, что Claude написал на слайды объяснения/отказ вместо контента
+META_SLIDE_RE = re.compile(r"(не могу|не вижу|не умею|не подключ|пришли(те)?\s+(мне|ещё|еще)|вариант\s*\d|"
+                           r"я\s+(бот|ии|нейросеть)|что выбираешь|какой вариант)", re.I)
 _PH = r"(фото|фотк|фоточ|снимк|картинк|кадр)"
 _IG = r"(инст|insta|профил|ленты|аккаунт|страниц)"
 INSTA_PHOTOS_RE = re.compile(rf"{_PH}[^.!?\n]{{0,50}}{_IG}|{_IG}[^.!?\n]{{0,50}}{_PH}", re.I)
@@ -1054,6 +1132,13 @@ async def run_carousel(update: Update, user_text: str, image: bytes | None = Non
     photos: list[bytes] = list(images or [])
     if image is not None:
         photos.insert(0, image)
+    if photos:
+        remember_photos(chat_id, photos)
+    elif REFERS_PHOTO_RE.search(user_text or "") or AI_ART_RE.search(user_text or ""):
+        photos = recent_photos(chat_id)   # «сделай из того фото, что скинул» — берём недавно присланные
+        if photos:
+            logger.info("Carousel: using %d recent photos from this chat", len(photos))
+    wants_art = bool(AI_ART_RE.search(user_text or ""))
     from_insta = False
     if INSTA_PHOTOS_RE.search(user_text or ""):
         try:
@@ -1080,6 +1165,9 @@ async def run_carousel(update: Update, user_text: str, image: bytes | None = Non
                                                          "data": base64.b64encode(_preview_jpeg(ph)).decode()}})
         own = len(photos) - (len(insta) if from_insta else 0)
         info = f"[Приложено фото: {len(photos)}."
+        if wants_art:
+            info += (" Анна просит ИИ-картинки по своему фото — добавь в design поле \"ai_art\" "
+                     "(см. пункт 7 инструкции).")
         if from_insta:
             info += f" Фото {own + 1}–{len(photos)} — последние снимки из Instagram Анны, выбери подходящие для слайдов."
         info += "]"
@@ -1108,8 +1196,42 @@ async def run_carousel(update: Update, user_text: str, image: bytes | None = Non
                   "illustration и она сломана — просто убери её. Вот ответ:\n\n" + reply[:60000]}],
                 9000, False)
             data = carousel.parse(fixed)
+        meta_hits = sum(1 for s in data["slides"] if META_SLIDE_RE.search(s.get("title", "") + " " + s.get("text", "")))
+        if meta_hits >= 2 or (data["slides"] and META_SLIDE_RE.search(data["slides"][0].get("title", ""))):
+            logger.warning("Carousel slides contain meta text (%d), retrying", meta_hits)
+            note = ("\n\n[ВАЖНО: в прошлый раз ты написала на слайды объяснения и варианты для Анны. Так нельзя. "
+                    "Слайды — только контент для её аудитории по теме запроса. Всё, что можно сделать — сделай: "
+                    "фото уже приложены, ИИ-картинки делаются через поле design.ai_art.]")
+            retry_content = (content + note) if isinstance(content, str) else content + [{"type": "text", "text": note}]
+            reply2, _, _ = await _create(current_system_prompt(), [{"role": "user", "content": retry_content}], 12000, False)
+            data = carousel.parse(reply2)
         raw = data.get("design") or {}
         d = carousel.resolve(raw, saved=design_store.saved(DATA_DIR))
+        art = raw.get("ai_art") if isinstance(raw.get("ai_art"), dict) else None
+        if art is None and wants_art and photos:
+            art = {"prompt": "elegant editorial painted portrait of the woman, soft light, luxury lifestyle mood", "count": 2}
+        if art and photos:
+            try:
+                await status.edit_text("🎨 Рисую ИИ-картинки по фото… это до 1–2 минут ⏳")
+            except Exception:
+                pass
+            try:
+                src_i = int(art.get("photo", 1))
+            except (TypeError, ValueError):
+                src_i = 1
+            src = photos[src_i - 1] if 1 <= src_i <= len(photos) else photos[0]
+            try:
+                cnt = int(art.get("count", 2))
+            except (TypeError, ValueError):
+                cnt = 2
+            arts, err = await generate_ai_portraits(src, str(art.get("prompt") or user_text), cnt)
+            logger.info("AI portraits: %d (%s)", len(arts), err or "ok")
+            if arts:
+                photos = arts
+                raw = {**raw, "slide_photos": None}
+                warn += f"\n🖼 Нарисовала {len(arts)} ИИ-картинк{'у' if len(arts) == 1 else 'и'} по фото."
+            else:
+                warn += f"\n⚠️ ИИ-картинку нарисовать не получилось ({err[:160]}) — сделала с оригинальными фото."
         slide_photos = _assign_photos(raw, photos, len(data["slides"]))
         n_used = sum(1 for x in slide_photos if x)
         logger.info("Carousel: %d slides, photos given=%d (insta=%s), chosen=%s, on slides=%d",
@@ -1518,8 +1640,9 @@ async def _flush_album(gid) -> None:
         return
     photos = [d for _, d in sorted(buf["photos"], key=lambda x: x[0])]
     caption, update = buf["caption"], buf["update"]
+    remember_photos(update.effective_chat.id, photos)
     try:
-        if caption and CAROUSEL_INTENT_RE.search(caption):
+        if caption and PHOTO_CAROUSEL_RE.search(caption):
             await run_carousel(update, caption, images=photos)
             return
         content = []
@@ -1554,7 +1677,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await _collect_album(update, data, caption)
         return
 
-    if caption and CAROUSEL_INTENT_RE.search(caption):
+    remember_photos(update.effective_chat.id, [data])
+    if caption and PHOTO_CAROUSEL_RE.search(caption):
         await run_carousel(update, caption, image=data, image_mime="image/jpeg")
         return
 
@@ -1609,7 +1733,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if is_image and update.message.media_group_id:
         await _collect_album(update, data, caption)
         return
-    if is_image and caption and CAROUSEL_INTENT_RE.search(caption):
+    if is_image:
+        remember_photos(update.effective_chat.id, [data])
+    if is_image and caption and PHOTO_CAROUSEL_RE.search(caption):
         await run_carousel(update, caption, image=data, image_mime=mime)
         return
 
