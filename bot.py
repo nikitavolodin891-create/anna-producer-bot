@@ -19,6 +19,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import anthropic
 from openai import AsyncOpenAI
 
+from prompt import BOT_CAPABILITIES
 from prompt import SYSTEM_PROMPT as ANNA_PROMPT, LINK_ANALYSIS_PROMPT, VIDEO_REVIEW_PROMPT, AUDIT_PROMPT, TRENDS_PROMPT, EDITOR_PROMPT, SCRIPT_FORMAT_NOTE, FIXER_PROMPT, CAROUSEL_PROMPT, WEB_SEARCH_NOTE
 import social
 import audit
@@ -127,7 +128,7 @@ MEMORY_RE = re.compile(r"<memory>(.*?)</memory>", re.DOTALL)
 
 def current_system_prompt() -> str:
     """Промпт Анны + свежие факты из последнего аудита её аккаунта (если он был)."""
-    prompt = SYSTEM_PROMPT
+    prompt = SYSTEM_PROMPT + BOT_CAPABILITIES
     saved = audit.load_client_audit(DATA_DIR)
     if saved:
         prompt += (
