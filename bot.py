@@ -26,6 +26,7 @@ import trends
 import facts
 import lint
 import carousel
+import design_store
 import datetime
 from telegram import InputMediaPhoto, InputMediaDocument
 
@@ -491,13 +492,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Понимаю голосовые и кружки 🎙\n"
         "• Разбираю рилсы и посты по ссылке (Instagram, TikTok, YouTube)\n"
         "• Читаю фото, PDF и сайты\n"
-        "• Делаю карусели — готовые картинки-слайды + подпись 🖼\n"
+        "• Делаю карусели — готовые картинки-слайды + подпись 🖼 Дизайн опиши словами, пришли скрин-пример или своё фото для обложки\n"
         "• Ищу в интернете свежее: цены, адреса, новости 🔎\n"
         "• Разбираю твои видео: пришли ролик — скажу, что с хуком и что улучшить 🎬\n\n"
         "Просто напиши или наговори, что нужно.\n"
         "/trends — что сейчас залетает в нише + 15 хуков для тебя\n"
         "/audit — аудит твоего Инстаграма (или /audit @ник — любого аккаунта)\n"
-        "/carousel тема — карусель-картинки для Instagram\n"
+        "/carousel тема — карусель-картинки для Instagram (дизайн — любыми словами или по скрину)\n"
+        "/designs — показать готовые дизайны каруселей\n"
         "/competitors — аккаунты-ориентиры для трендов\n"
         "/memory — что я о тебе помню (добавить: «Запомни: …»)\n"
         "/new — начать новый диалог (забыть контекст)"
@@ -774,6 +776,9 @@ async def process_user_text(update: Update, user_text: str) -> None:
     chat_id = update.effective_chat.id
     urls = URL_RE.findall(user_text)[:MAX_LINKS_PER_MESSAGE]
 
+    if await handle_design_commands(update, user_text):
+        return
+
     to_remember = facts.extract(user_text)
     if to_remember:
         await remember_fact(update, to_remember)
@@ -851,8 +856,15 @@ async def carousel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text(
             "Напиши тему или свой текст, например:\n"
             "/carousel 5 причин, почему деньги уходят быстрее, чем приходят\n\n"
-            "Можно и без команды: «сделай карусель про …». Оформление: светлое по умолчанию, "
-            "можно попросить «тёмную» или «розовую». Поправить: «в карусели поменяй слайд 3 …»."
+            "Можно и без команды: «сделай карусель про …».\n\n"
+            "🎨 Дизайн — как хочешь:\n"
+            "• словами: «в стиле old money», «бордовый с золотом», «как море на Мальдивах»\n"
+            "• готовый: /designs — покажу все стили\n"
+            "• по примеру: пришли скрин понравившейся карусели с подписью «сделай карусель про … в таком стиле»\n"
+            "• со своим фото: пришли фото с подписью «карусель про …» — оно станет обложкой\n"
+            "• нейрофон: «… с нейрофоном: вилла на Бали на закате»\n\n"
+            "Понравился дизайн — «запомни дизайн как мой шёлк», потом «карусель про … в дизайне мой шёлк». "
+            "Сохранить как «основной» — будет по умолчанию."
         )
         return
     await run_carousel(update, "Сделай карусель: " + topic)
@@ -860,48 +872,185 @@ async def carousel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 def _carousel_history(reply: str) -> str:
     try:
-        return "[Карусель]\n" + carousel.as_text(carousel.parse(reply))
+        data = carousel.parse(reply)
+        return "[Карусель]\n" + carousel.as_text(data) + "\n\n" + carousel.design_note(data.get("design"))
     except Exception:
         return reply
 
 
-async def run_carousel(update: Update, user_text: str) -> None:
-    """Тексты слайдов пишет Claude (JSON), картинки рисует carousel.py, шлём альбомом + подпись."""
+IMAGE_MODEL = os.environ.get("IMAGE_MODEL", "gpt-image-1")
+AI_BG_SUFFIX = (
+    ", vertical 4:5 composition, photorealistic editorial photography, soft natural light, calm areas of "
+    "negative space for overlay text, high-end lifestyle aesthetic. No people, no faces, no text, no letters, "
+    "no logos, no watermark."
+)
+
+
+async def generate_ai_background(prompt: str) -> tuple[bytes | None, str]:
+    """Фон-картинка от OpenAI. Возвращает (байты, причина_ошибки)."""
+    if openai_client is None:
+        return None, "нет ключа OpenAI"
+    full = prompt.strip()[:900] + AI_BG_SUFFIX
+    errors = []
+    attempts = [
+        dict(model=IMAGE_MODEL, prompt=full, size="1024x1536", quality="medium", n=1),
+        dict(model="dall-e-3", prompt=full, size="1024x1792", quality="standard", response_format="b64_json", n=1),
+    ]
+    for kw in attempts:
+        try:
+            r = await asyncio.wait_for(openai_client.images.generate(**kw), timeout=150)
+            item = r.data[0]
+            if getattr(item, "b64_json", None):
+                return base64.b64decode(item.b64_json), ""
+            if getattr(item, "url", None):
+                async with httpx.AsyncClient(timeout=60) as h:
+                    resp = await h.get(item.url)
+                    resp.raise_for_status()
+                    return resp.content, ""
+        except Exception as e:
+            logger.warning("Image generation failed (%s): %s", kw["model"], e)
+            errors.append(f"{kw['model']}: {str(e)[:120]}")
+    return None, "; ".join(errors) or "неизвестная ошибка"
+
+
+async def run_carousel(update: Update, user_text: str, image: bytes | None = None, image_mime: str = "image/jpeg") -> None:
+    """Тексты и дизайн пишет Claude (JSON), картинки рисует carousel.py, шлём альбомом + файлами + подпись."""
     chat_id = update.effective_chat.id
-    status = await update.effective_message.reply_text("🎨 Пишу тексты слайдов и рисую карусель… ⏳")
+    status = await update.effective_message.reply_text("🎨 Пишу тексты слайдов и собираю дизайн… ⏳")
+    prompt = CAROUSEL_PROMPT.replace("{saved_designs}", design_store.prompt_block(DATA_DIR))
+    prev = design_store.last(DATA_DIR, chat_id)
+    if prev:
+        prompt += "\n\nДизайн прошлой карусели: " + json.dumps(prev, ensure_ascii=False)
+    if image is not None:
+        content = [
+            {"type": "image", "source": {"type": "base64", "media_type": image_mime, "data": base64.b64encode(image).decode()}},
+            {"type": "text", "text": (user_text or "Сделай карусель") + "\n\n[К сообщению приложено фото.]\n\n" + prompt},
+        ]
+        note = f"[Фото] {user_text}"
+    else:
+        content = user_text + "\n\n" + prompt
+        note = user_text
     reply = await ask_claude(
-        update, chat_id, user_text + "\n\n" + CAROUSEL_PROMPT, history_note=user_text,
-        max_tokens=6000, web_search=True, send=False, edit=False, history_reply=_carousel_history,
+        update, chat_id, content, history_note=note,
+        max_tokens=7000, web_search=True, send=False, edit=False, history_reply=_carousel_history,
     )
     if reply is None:
         return
+    warn = ""
     try:
         data = carousel.parse(reply)
-        theme = carousel.pick_theme(user_text)
-        images = await asyncio.to_thread(carousel.render, data, theme)
+        raw = data.get("design") or {}
+        d = carousel.resolve(raw, saved=design_store.saved(DATA_DIR))
+        photo = image if (image is not None and raw.get("photo_use") == "cover") else None
+        ai_bg = None
+        if d["background"].get("type") == "ai":
+            try:
+                await status.edit_text("🖼 Генерирую нейрофон… это до минуты ⏳")
+            except Exception:
+                pass
+            ai_bg, err = await generate_ai_background(str(raw.get("ai_prompt") or d.get("ai_prompt") or user_text))
+            if ai_bg is None:
+                warn = f"\n\n⚠️ Нейрофон не получился ({err[:200]}) — нарисовала без него."
+        images = await asyncio.to_thread(carousel.render, data, d, photo, ai_bg)
     except Exception as e:
         logger.exception("Carousel error")
         await status.edit_text(f"Не получилось собрать карусель ({e}). Попробуй ещё раз или переформулируй.")
         return
+    design_store.set_last(DATA_DIR, chat_id, carousel.public(d))
     try:
         await status.delete()
     except Exception:
         pass
     n = len(images)
-    await update.effective_message.reply_media_group(
-        [InputMediaPhoto(img) for img in images]
-    )
+    await update.effective_message.reply_media_group([InputMediaPhoto(img) for img in images])
     # те же слайды файлами — без сжатия Telegram, для загрузки в Instagram в полном качестве
     await update.effective_message.reply_media_group(
         [InputMediaDocument(img, filename=f"slide_{i:02d}.png") for i, img in enumerate(images, 1)]
     )
-    text = carousel.as_text(data)
+    label = d.get("label") if raw.get("preset") and len(raw) <= 2 else None
+    if raw.get("saved"):
+        label = f"сохранённый «{raw['saved']}»"
+    design_line = f"🎨 Дизайн: {label}" if label else "🎨 Дизайн: свой, собран под запрос"
     await send_long(
         update,
-        f"✅ Карусель готова: {n} слайдов (сверху — превью, ниже — файлы в полном качестве для Instagram).\n\n"
-        + text
-        + "\n\n_Поправить: «в карусели поменяй слайд 3 на …», «сделай тёмную/розовую», «сократи текст»._",
+        f"✅ Карусель готова: {n} слайдов (сверху — превью, ниже — файлы в полном качестве для Instagram).\n"
+        + design_line + warn + "\n\n"
+        + carousel.as_text(data)
+        + "\n\n_Поправить: «в карусели поменяй слайд 3 на …», «перерисуй в изумруде / темнее / с золотом». "
+          "Понравился дизайн — «запомни дизайн как …». Все стили — /designs._",
     )
+
+
+# ---------------------------------------------------------------------------
+# Дизайны: показать, сохранить, удалить
+# ---------------------------------------------------------------------------
+DESIGN_LIST_RE = re.compile(r"^\s*(покажи|какие|список)\b.{0,25}\b(дизайн|стил|оформлени)", re.I)
+DESIGN_SAVE_RE = re.compile(
+    r"^\s*(запомни|сохрани)\s+(этот\s+|этот\s+же\s+|последний\s+)?(дизайн|стиль|оформление)(\s+карусели)?"
+    r"(\s*(как|под\s+названием|:|—|-)?\s*(?P<name>.+?))?\s*$", re.I)
+DESIGN_DELETE_RE = re.compile(r"^\s*(удали|забудь)\s+(дизайн|стиль)\s+(?P<name>.+?)\s*$", re.I)
+_preview_cache: dict[str, bytes] = {}
+
+
+async def handle_design_commands(update: Update, text: str) -> bool:
+    t = (text or "").strip()
+    if len(t) > 120:
+        return False
+    m = DESIGN_SAVE_RE.match(t)
+    if m:
+        last = design_store.last(DATA_DIR, update.effective_chat.id)
+        if not last:
+            await update.effective_message.reply_text("Пока нечего запоминать — сначала сделаем карусель 🙂")
+            return True
+        name = (m.group("name") or "основной").strip()
+        key = design_store.save_design(DATA_DIR, name, last)
+        extra = " Теперь он будет по умолчанию." if key == "основной" else f" Пиши: «карусель про … в дизайне {key}»."
+        await update.effective_message.reply_text(f"💾 Запомнила дизайн как «{key}».{extra}")
+        return True
+    m = DESIGN_DELETE_RE.match(t)
+    if m:
+        ok = design_store.delete(DATA_DIR, m.group("name"))
+        await update.effective_message.reply_text("🗑 Удалила." if ok else "Такого сохранённого дизайна нет. Список — /designs")
+        return True
+    if DESIGN_LIST_RE.match(t):
+        await show_designs(update)
+        return True
+    return False
+
+
+async def designs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await show_designs(update)
+
+
+async def show_designs(update: Update) -> None:
+    status = await update.effective_message.reply_text("Рисую примеры дизайнов… ⏳")
+    names = list(carousel.PRESETS)
+    try:
+        missing = [n for n in names if n not in _preview_cache]
+        if missing:
+            rendered = await asyncio.to_thread(lambda: {n: carousel.preview_cover(n) for n in missing})
+            _preview_cache.update(rendered)
+    except Exception as e:
+        logger.exception("Preview error")
+        await status.edit_text(f"Не получилось нарисовать примеры ({e}).")
+        return
+    try:
+        await status.delete()
+    except Exception:
+        pass
+    for chunk in (names[:10], names[10:]):
+        if chunk:
+            await update.effective_message.reply_media_group(
+                [InputMediaPhoto(_preview_cache[n], caption=f"{carousel.PRESETS[n]['label']} — «{n}»") for n in chunk]
+            )
+    saved = design_store.saved(DATA_DIR)
+    lines = [f"• {carousel.PRESETS[n]['label']} — {n}" for n in names]
+    txt = "🎨 Готовые дизайны:\n" + "\n".join(lines)
+    if saved:
+        txt += "\n\n💾 Твои сохранённые: " + ", ".join(f"«{k}»" for k in saved)
+    txt += ("\n\nПиши: «карусель про деньги в стиле emerald» или опиши свой: «бордовый бархат с золотом», "
+            "«как море». Можно прислать скрин-пример или фото для обложки.")
+    await update.effective_message.reply_text(txt)
 
 
 PLATFORM_NAMES = {"instagram": "Инстаграм", "tiktok": "TikTok", "youtube": "YouTube"}
@@ -1176,6 +1325,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(f"Не получилось скачать фото: {e}\nПопробуй ещё раз.")
         return
 
+    if caption and CAROUSEL_INTENT_RE.search(caption):
+        await run_carousel(update, caption, image=data, image_mime="image/jpeg")
+        return
+
     content = [
         {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": base64.b64encode(data).decode()}},
         {"type": "text", "text": caption or DEFAULT_IMAGE_PROMPT},
@@ -1222,6 +1375,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception as e:
         logger.exception("Document download error")
         await update.message.reply_text(f"Не получилось скачать файл: {e}\nПопробуй ещё раз.")
+        return
+
+    if is_image and caption and CAROUSEL_INTENT_RE.search(caption):
+        await run_carousel(update, caption, image=data, image_mime=mime)
         return
 
     if is_pdf:
@@ -1298,6 +1455,7 @@ def main() -> None:
     app.add_handler(CommandHandler(["trends", "hooks"], guarded(trends_command)))
     app.add_handler(CommandHandler("competitors", guarded(competitors_command)))
     app.add_handler(CommandHandler(["carousel", "karusel"], guarded(carousel_command)))
+    app.add_handler(CommandHandler(["designs", "design"], guarded(designs_command)))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, guarded(handle_video)))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE, guarded(handle_voice)))
     app.add_handler(MessageHandler(filters.PHOTO, guarded(handle_photo)))

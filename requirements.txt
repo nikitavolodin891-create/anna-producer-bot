@@ -5,3 +5,4 @@ openai==1.54.0
 beautifulsoup4==4.12.3
 yt-dlp>=2026.8.19
 Pillow==11.3.0
+numpy==2.2.6

@@ -1,3 +1,8 @@
+Fonts bundled with this bot, all licensed under the SIL Open Font License 1.1 (Google Fonts):
+Montserrat (The Montserrat Project Authors), Playfair Display (Claus Eggers Sørensen),
+Cormorant Garamond (Christian Thalmann), Forum (Denis Masharov), Tenor Sans (Denis Masharov),
+Great Vibes (Robert Leuschke), Manrope (Mikhail Sharanda).
+
 Copyright 2024 The Montserrat.Git Project Authors (https://github.com/JulietaUla/Montserrat.git)
 
 This Font Software is licensed under the SIL Open Font License, Version 1.1.
