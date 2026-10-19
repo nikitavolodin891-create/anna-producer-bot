@@ -913,7 +913,92 @@ async def generate_ai_background(prompt: str) -> tuple[bytes | None, str]:
     return None, "; ".join(errors) or "неизвестная ошибка"
 
 
-async def run_carousel(update: Update, user_text: str, image: bytes | None = None, image_mime: str = "image/jpeg") -> None:
+MAX_CAROUSEL_PHOTOS = 14
+_PH = r"(фото|фотк|фоточ|снимк|картинк|кадр)"
+_IG = r"(инст|insta|профил|ленты|аккаунт|страниц)"
+INSTA_PHOTOS_RE = re.compile(rf"{_PH}[^.!?\n]{{0,50}}{_IG}|{_IG}[^.!?\n]{{0,50}}{_PH}", re.I)
+_insta_cache: dict = {"t": 0.0, "photos": []}
+
+
+def _preview_jpeg(data: bytes, side: int = 900) -> bytes:
+    """Уменьшенная копия фото для Claude (экономим токены)."""
+    from PIL import Image as _Image, ImageOps as _ImageOps
+    im = _Image.open(io.BytesIO(data))
+    try:
+        im = _ImageOps.exif_transpose(im)
+    except Exception:
+        pass
+    im = im.convert("RGB")
+    im.thumbnail((side, side))
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=82)
+    return buf.getvalue()
+
+
+def _assign_photos(raw: dict, photos: list[bytes], n_slides: int) -> list:
+    """Какое фото на какой слайд: из design.slide_photos (номера с 1) или старое photo_use=cover."""
+    per = [None] * n_slides
+    if not photos or raw.get("photo_use") == "reference":
+        return per
+    sp = raw.get("slide_photos")
+    if isinstance(sp, list) and sp:
+        used = set()
+        for i, v in enumerate(sp[:n_slides]):
+            try:
+                k = int(v)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= k <= len(photos) and k not in used:
+                per[i] = photos[k - 1]
+                used.add(k)
+    elif raw.get("photo_use") == "cover" or (len(photos) == 1 and raw.get("photo_use") != "reference"):
+        per[0] = photos[0]
+    return per
+
+
+async def fetch_insta_photos(limit: int = 12) -> tuple[list[bytes], str]:
+    """Последние фото из Instagram Анны через Apify (кэш на час)."""
+    import time as _time
+    if _insta_cache["photos"] and _time.time() - _insta_cache["t"] < 3600:
+        return _insta_cache["photos"], ""
+    try:
+        posts = await audit._apify({"directUrls": [f"https://www.instagram.com/{audit.CLIENT_INSTAGRAM}/"],
+                                    "resultsType": "posts", "resultsLimit": 24, "addParentData": False}, timeout=180)
+    except Exception as e:
+        return [], str(e)[:150]
+    urls: list[str] = []
+    videos: list[str] = []
+    for p in posts:
+        if not isinstance(p, dict) or p.get("error"):
+            continue
+        kind = (p.get("type") or "").lower()
+        if kind == "video":
+            if p.get("displayUrl"):
+                videos.append(p["displayUrl"])
+            continue
+        cand = [c.get("displayUrl") for c in (p.get("childPosts") or []) if isinstance(c, dict) and (c.get("type") or "").lower() != "video"]
+        cand = [u for u in cand if u] or list(p.get("images") or []) or [p.get("displayUrl")]
+        urls += [u for u in cand[:2] if u]
+    urls = (urls + videos)[: limit + 6]
+    out: list[bytes] = []
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"}) as h:
+        for u in urls:
+            if len(out) >= limit:
+                break
+            try:
+                r = await h.get(u)
+                if r.status_code == 200 and r.headers.get("content-type", "").startswith("image"):
+                    out.append(r.content)
+            except Exception:
+                continue
+    if not out:
+        return [], "не нашла фото в последних публикациях"
+    _insta_cache.update(t=_time.time(), photos=out)
+    return out, ""
+
+
+async def run_carousel(update: Update, user_text: str, image: bytes | None = None, image_mime: str = "image/jpeg",
+                       images: list[bytes] | None = None) -> None:
     """Тексты и дизайн пишет Claude (JSON), картинки рисует carousel.py, шлём альбомом + файлами + подпись."""
     chat_id = update.effective_chat.id
     status = await update.effective_message.reply_text("🎨 Пишу тексты слайдов и собираю дизайн… ⏳")
@@ -921,18 +1006,45 @@ async def run_carousel(update: Update, user_text: str, image: bytes | None = Non
     prev = design_store.last(DATA_DIR, chat_id)
     if prev:
         prompt += "\n\nДизайн прошлой карусели: " + json.dumps(prev, ensure_ascii=False)
+    photos: list[bytes] = list(images or [])
     if image is not None:
-        content = [
-            {"type": "image", "source": {"type": "base64", "media_type": image_mime, "data": base64.b64encode(image).decode()}},
-            {"type": "text", "text": (user_text or "Сделай карусель") + "\n\n[К сообщению приложено фото.]\n\n" + prompt},
-        ]
-        note = f"[Фото] {user_text}"
+        photos.insert(0, image)
+    from_insta = False
+    if INSTA_PHOTOS_RE.search(user_text or ""):
+        try:
+            await status.edit_text("📸 Смотрю фото в Instagram Анны… это до минуты ⏳")
+        except Exception:
+            pass
+        insta, err = await fetch_insta_photos()
+        if insta:
+            photos += insta
+            from_insta = True
+        else:
+            await update.effective_message.reply_text(f"Не получилось взять фото из Instagram ({err}). Сделаю без них.")
+        try:
+            await status.edit_text("🎨 Пишу тексты слайдов и собираю дизайн… ⏳")
+        except Exception:
+            pass
+    photos = photos[:MAX_CAROUSEL_PHOTOS]
+    if photos:
+        content = []
+        for i, ph in enumerate(photos, 1):
+            content.append({"type": "text", "text": f"Фото {i}:"})
+            content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                                         "data": base64.b64encode(_preview_jpeg(ph)).decode()}})
+        own = len(photos) - (len(insta) if from_insta else 0)
+        info = f"[Приложено фото: {len(photos)}."
+        if from_insta:
+            info += f" Фото {own + 1}–{len(photos)} — последние снимки из Instagram Анны, выбери подходящие для слайдов."
+        info += "]"
+        content.append({"type": "text", "text": (user_text or "Сделай карусель") + "\n\n" + info + "\n\n" + prompt})
+        note = f"[Фото: {len(photos)}] {user_text}"
     else:
         content = user_text + "\n\n" + prompt
         note = user_text
     reply = await ask_claude(
         update, chat_id, content, history_note=note,
-        max_tokens=7000, web_search=True, send=False, edit=False, history_reply=_carousel_history,
+        max_tokens=12000, web_search=True, send=False, edit=False, history_reply=_carousel_history,
     )
     if reply is None:
         return
@@ -941,7 +1053,7 @@ async def run_carousel(update: Update, user_text: str, image: bytes | None = Non
         data = carousel.parse(reply)
         raw = data.get("design") or {}
         d = carousel.resolve(raw, saved=design_store.saved(DATA_DIR))
-        photo = image if (image is not None and raw.get("photo_use") == "cover") else None
+        slide_photos = _assign_photos(raw, photos, len(data["slides"]))
         ai_bg = None
         if d["background"].get("type") == "ai":
             try:
@@ -951,7 +1063,7 @@ async def run_carousel(update: Update, user_text: str, image: bytes | None = Non
             ai_bg, err = await generate_ai_background(str(raw.get("ai_prompt") or d.get("ai_prompt") or user_text))
             if ai_bg is None:
                 warn = f"\n\n⚠️ Нейрофон не получился ({err[:200]}) — нарисовала без него."
-        images = await asyncio.to_thread(carousel.render, data, d, photo, ai_bg)
+        images = await asyncio.to_thread(carousel.render, data, d, None, ai_bg, slide_photos)
     except Exception as e:
         logger.exception("Carousel error")
         await status.edit_text(f"Не получилось собрать карусель ({e}). Попробуй ещё раз или переформулируй.")
@@ -1309,6 +1421,49 @@ DEFAULT_IMAGE_PROMPT = (
 SUPPORTED_IMAGE_MIMES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 
 
+_album_buffers: dict = {}
+ALBUM_WAIT = 2.5
+
+
+async def _collect_album(update: Update, data: bytes, caption: str) -> None:
+    """Несколько фото одним сообщением Telegram присылает по одному — собираем их вместе."""
+    gid = update.message.media_group_id
+    buf = _album_buffers.setdefault(gid, {"photos": [], "caption": "", "update": update, "task": None})
+    buf["photos"].append((update.message.message_id, data))
+    if caption and not buf["caption"]:
+        buf["caption"] = caption
+        buf["update"] = update
+    if buf["task"]:
+        buf["task"].cancel()
+    buf["task"] = asyncio.create_task(_flush_album(gid))
+
+
+async def _flush_album(gid) -> None:
+    try:
+        await asyncio.sleep(ALBUM_WAIT)
+    except asyncio.CancelledError:
+        return
+    buf = _album_buffers.pop(gid, None)
+    if not buf:
+        return
+    photos = [d for _, d in sorted(buf["photos"], key=lambda x: x[0])]
+    caption, update = buf["caption"], buf["update"]
+    try:
+        if caption and CAROUSEL_INTENT_RE.search(caption):
+            await run_carousel(update, caption, images=photos)
+            return
+        content = []
+        for i, ph in enumerate(photos[:MAX_CAROUSEL_PHOTOS], 1):
+            content.append({"type": "text", "text": f"Фото {i}:"})
+            content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                                         "data": base64.b64encode(_preview_jpeg(ph, 1400)).decode()}})
+        content.append({"type": "text", "text": caption or DEFAULT_IMAGE_PROMPT})
+        await ask_claude(update, update.effective_chat.id, content, history_note=f"[Фото: {len(photos)}] {caption}")
+    except Exception:
+        logger.exception("Album processing error")
+        await update.effective_message.reply_text("Не получилось обработать фото. Попробуй ещё раз.")
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Фото: отправляем в Claude как изображение (у Claude есть зрение)."""
     photo = update.message.photo[-1] if update.message.photo else None
@@ -1323,6 +1478,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except Exception as e:
         logger.exception("Photo download error")
         await update.message.reply_text(f"Не получилось скачать фото: {e}\nПопробуй ещё раз.")
+        return
+
+    if update.message.media_group_id:
+        await _collect_album(update, data, caption)
         return
 
     if caption and CAROUSEL_INTENT_RE.search(caption):
@@ -1377,6 +1536,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text(f"Не получилось скачать файл: {e}\nПопробуй ещё раз.")
         return
 
+    if is_image and update.message.media_group_id:
+        await _collect_album(update, data, caption)
+        return
     if is_image and caption and CAROUSEL_INTENT_RE.search(caption):
         await run_carousel(update, caption, image=data, image_mime=mime)
         return

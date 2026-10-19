@@ -14,6 +14,11 @@ import random
 import re
 
 import numpy as np
+
+try:
+    import resvg_py  # рендер SVG-иллюстраций, которые рисует Claude
+except Exception:  # pragma: no cover
+    resvg_py = None
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 W, H = 1080, 1350          # 4:5 — максимальная площадь в ленте Instagram
@@ -83,7 +88,10 @@ def as_text(data: dict) -> str:
 
 def design_note(design: dict) -> str:
     """Короткая запись дизайна для истории диалога (чтобы правки «сделай темнее» работали)."""
-    d = {k: v for k, v in (design or {}).items() if k not in ("_photo",)}
+    d = {k: v for k, v in (design or {}).items() if not str(k).startswith("_")}
+    if isinstance(d.get("illustration"), dict):  # сам SVG в историю не кладём — он лежит в «последнем дизайне»
+        ill = d["illustration"]
+        d["illustration"] = f"[SVG-иллюстрация: {ill.get('place', 'top')}, {ill.get('on', 'cover')}]"
     return "Дизайн: " + json.dumps(d, ensure_ascii=False)
 
 
@@ -487,7 +495,11 @@ def _sun(a, x, y, r, col, s):
 
 
 def _cover_crop(im, w=W, h=H):
-    return ImageOps.fit(im.convert("RGB"), (w, h), Image.LANCZOS, centering=(0.5, 0.4))
+    try:
+        im = ImageOps.exif_transpose(im)
+    except Exception:
+        pass
+    return ImageOps.fit(im.convert("RGB"), (w, h), Image.LANCZOS, centering=(0.5, 0.35))
 
 
 def _luma(col):
@@ -504,14 +516,16 @@ def build_background(d: dict, role: str, idx: int, photo=None, ai_bg=None) -> Im
     c0 = cols[0]
     c1 = cols[1] if len(cols) > 1 else c0
     seed = 11 + idx
-    if role == "cover" and photo is not None:
-        t = "photo"
-    if t == "photo" and photo is not None:
+    if photo is not None:
+        # фото на слайде: снизу тёмный градиент под текст (на внутренних слайдах — плотнее)
         im = _cover_crop(photo)
         a = np.asarray(im).astype(np.float32)
-        dark = True
-        grad = np.clip((_YY / H - 0.25) / 0.75, 0, 1)[..., None] ** 1.3
-        a = a * (1 - grad * 0.78) + (_hex("#0E0A0A") if dark else _hex("#F7F1EA")) * grad * 0.78
+        start = 0.25 if role == "cover" else 0.12
+        grad = np.clip((_YY / H - start) / (1 - start), 0, 1)[..., None] ** 1.2
+        k = 0.78 if role == "cover" else 0.86
+        a = a * (1 - grad * k) + _hex("#0E0A0A") * grad * k
+        if role != "cover":
+            a = a * 0.88
         return _img(_grain(a, 4, seed))
     if t == "ai" and ai_bg is not None:
         im = _cover_crop(ai_bg)
@@ -774,12 +788,89 @@ def resolve(design: dict | None, saved: dict | None = None) -> dict:
     d["ornaments"] = [o for o in (d.get("ornaments") or []) if isinstance(o, str)]
     d["_gold_orn"] = "gold_frame" in d["ornaments"] or d.get("accent") == "@gold" or d.get("ink") == "@gold"
     d["_light_ink"] = _luma(d["ink"]) >= 128
+    ill = d.get("illustration")
+    if isinstance(ill, dict):
+        svg = clean_svg(ill.get("svg"))
+        if svg:
+            place = ill.get("place") if ill.get("place") in ("top", "bottom", "corner", "background") else "top"
+            on = ill.get("on") if ill.get("on") in ("cover", "all", "cover_end", "end") else "cover"
+            try:
+                op = float(ill.get("opacity", 0.22 if place == "background" else 1.0))
+            except (TypeError, ValueError):
+                op = 1.0
+            d["illustration"] = {"svg": svg, "place": place, "on": on, "opacity": max(0.05, min(1.0, op)), "_svg": True}
+        else:
+            d.pop("illustration")
+    elif "illustration" in d:
+        d.pop("illustration")
     return d
 
 
 def public(d: dict) -> dict:
     """Дизайн без служебных полей — для сохранения и показа."""
     return {k: v for k, v in d.items() if not k.startswith("_") and k != "label"}
+
+
+# ===========================================================================
+# SVG-иллюстрации (рисует Claude)
+# ===========================================================================
+MAX_SVG = 60000
+_SVG_BAD = [
+    (re.compile(r"<script\b.*?</script>", re.I | re.S), ""),
+    (re.compile(r"<foreignObject\b.*?</foreignObject>", re.I | re.S), ""),
+    (re.compile(r"<(text|tspan|textPath)\b.*?</\1>", re.I | re.S), ""),   # шрифтов в контейнере нет — текст кладёт бот
+    (re.compile(r"<image\b[^>]*/?>", re.I), ""),
+    (re.compile(r"\son\w+\s*=\s*(\"[^\"]*\"|'[^']*')", re.I), ""),
+    (re.compile(r"(xlink:)?href\s*=\s*(\"(?!#)[^\"]*\"|'(?!#)[^']*')", re.I), ""),
+]
+_svg_cache: dict = {}
+
+
+def clean_svg(svg) -> str | None:
+    if not isinstance(svg, str):
+        return None
+    m = re.search(r"<svg\b.*?</svg>", svg, re.I | re.S)
+    if not m or len(m.group(0)) > MAX_SVG:
+        return None
+    out = m.group(0)
+    for rx, rep in _SVG_BAD:
+        out = rx.sub(rep, out)
+    if "xmlns=" not in out[:300]:
+        out = out.replace("<svg", '<svg xmlns="http://www.w3.org/2000/svg"', 1)
+    return out
+
+
+def svg_image(svg: str, box_w: int, box_h: int) -> Image.Image | None:
+    """SVG → RGBA, вписанный в коробку box_w×box_h (пропорции сохраняются)."""
+    key = (hash(svg), box_w, box_h)
+    if key in _svg_cache:
+        return _svg_cache[key]
+    if resvg_py is None:
+        return None
+    try:
+        png = resvg_py.svg_to_bytes(svg_string=svg, width=box_w * 2)
+        im = Image.open(io.BytesIO(bytes(png))).convert("RGBA")
+    except Exception:
+        return None
+    bb = im.getbbox()
+    if not bb:
+        return None
+    im = im.crop(bb)
+    k = min(box_w / im.width, box_h / im.height)
+    im = im.resize((max(1, int(im.width * k)), max(1, int(im.height * k))), Image.LANCZOS)
+    _svg_cache[key] = im
+    return im
+
+
+def _illustration_for(d: dict, role: str):
+    ill = d.get("illustration")
+    if not isinstance(ill, dict) or not ill.get("_svg"):
+        return None
+    on = ill.get("on", "cover")
+    if on == "all" or (on == "cover" and role == "cover") or (on == "cover_end" and role in ("cover", "end")) \
+            or (on == "end" and role == "end"):
+        return ill
+    return None
 
 
 # ===========================================================================
@@ -796,9 +887,9 @@ def render_slide(slide: dict, idx: int, total: int, d: dict, photo=None, ai_bg=N
     bd = d
     if role in ("cover", "end") and d.get(f"{role}_background"):
         bd = {**d, "background": d[f"{role}_background"]}
-    img = build_background(bd, role, idx, photo=photo if role == "cover" else None, ai_bg=ai_bg)
+    img = build_background(bd, role, idx, photo=photo, ai_bg=ai_bg)
     ink, acc, muted = _role_colors(d, role)
-    photo_cover = role == "cover" and photo is not None
+    photo_cover = photo is not None  # слайд с фото (обложка или внутренний)
     if photo_cover:
         # на фото текст всегда светлый поверх тёмного градиента — так читается на любом снимке
         ink, muted = "#FFFFFF", "#EDE3D8"
@@ -832,7 +923,40 @@ def render_slide(slide: dict, idx: int, total: int, d: dict, photo=None, ai_bg=N
     if role == "cover" and "monogram" in orn:
         top_lim = 300
     if photo_cover:
-        top_lim = int(H * 0.42)
+        top_lim = int(H * (0.42 if role == "cover" else 0.30))
+
+    ill = None if photo_cover else _illustration_for(d, role)
+    ill_img, ill_pos = None, None
+    if ill:
+        place = ill["place"]
+        is_small = role != "cover"
+        if place == "top":
+            bh = int(H * (0.22 if is_small else 0.34))
+            im = svg_image(ill["svg"], iw, bh)
+            if im is not None:
+                ill_img, ill_pos = im, ((W - im.width) // 2 if al == "center" or not is_small else P, top_lim)
+                top_lim += im.height + 40
+        elif place == "bottom":
+            bh = int(H * (0.2 if is_small else 0.3))
+            im = svg_image(ill["svg"], iw, bh)
+            if im is not None:
+                ill_img, ill_pos = im, ((W - im.width) // 2, bot_lim - im.height)
+                bot_lim -= im.height + 40
+        elif place == "corner":
+            sz = 210 if is_small else 300
+            im = svg_image(ill["svg"], sz, sz)
+            if im is not None:
+                ill_img, ill_pos = im, (W - P - im.width + 30, max(70, top_lim - 110))
+                top_lim = max(top_lim, ill_pos[1] + im.height + 30)
+        else:  # background
+            im = svg_image(ill["svg"], W - 160, H - 300)
+            if im is not None:
+                a = im.getchannel("A").point(lambda v: int(v * ill["opacity"]))
+                im = im.copy()
+                im.putalpha(a)
+                ill_img, ill_pos = im, ((W - im.width) // 2, (H - im.height) // 2)
+    if ill_img is not None:
+        img.paste(ill_img, ill_pos, ill_img)
 
     # Подбираем масштаб так, чтобы весь блок поместился
     base_sizes = {"cover": (140, 40), "mid": (100, 40), "end": (100, 38)}[role]
@@ -939,12 +1063,18 @@ def render_slide(slide: dict, idx: int, total: int, d: dict, photo=None, ai_bg=N
     return buf.getvalue()
 
 
-def render(data: dict, design: dict | None = None, photo: bytes | None = None, ai_bg: bytes | None = None) -> list[bytes]:
+def render(data: dict, design: dict | None = None, photo: bytes | None = None, ai_bg: bytes | None = None,
+           slide_photos: list | None = None) -> list[bytes]:
+    """slide_photos — фото по слайдам (bytes или None на каждый слайд). photo — только для обложки."""
     d = design if (design and "_light_ink" in design) else resolve(design or data.get("design"))
-    ph = Image.open(io.BytesIO(photo)) if photo else None
-    ai = Image.open(io.BytesIO(ai_bg)) if ai_bg else None
     total = len(data["slides"])
-    return [render_slide(s, i, total, d, ph, ai) for i, s in enumerate(data["slides"], 1)]
+    per = list(slide_photos or [])[:total]
+    per += [None] * (total - len(per))
+    if photo and not per[0]:
+        per[0] = photo
+    opened = [Image.open(io.BytesIO(b)) if b else None for b in per]
+    ai = Image.open(io.BytesIO(ai_bg)) if ai_bg else None
+    return [render_slide(s, i, total, d, opened[i - 1], ai) for i, s in enumerate(data["slides"], 1)]
 
 
 SAMPLE = {"slides": [
