@@ -41,9 +41,11 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # нужен для распознавания голосовых и кружков
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 CLAUDE_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "4000"))
+# Дешёвая модель для простых вопросов (контент всегда пишет CLAUDE_MODEL). Выключить: FAST_MODEL=off
+FAST_MODEL = os.environ.get("FAST_MODEL", "claude-haiku-4-5")
 # Поиск в интернете (встроенный инструмент Claude): $10 за 1000 поисков + токены результатов.
 WEB_SEARCH_ENABLED = os.environ.get("WEB_SEARCH_ENABLED", "1") != "0"
-WEB_SEARCH_MAX_USES = int(os.environ.get("WEB_SEARCH_MAX_USES", "5"))
+WEB_SEARCH_MAX_USES = int(os.environ.get("WEB_SEARCH_MAX_USES", "2"))
 
 # Кому разрешено пользоваться ботом: Telegram user ID через запятую.
 # Пусто — бот открыт всем (так было раньше). Узнать свой ID: команда /id.
@@ -71,7 +73,7 @@ SYSTEM_PROMPT = ANNA_PROMPT + FORMAT_NOTE
 # DATA_DIR указывает на подключённый в Railway Volume (переживает redeploy).
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 HISTORY_FILE = os.path.join(DATA_DIR, "conversations.json")
-MAX_HISTORY_MESSAGES = 40  # сколько последних сообщений на чат храним и передаём модели
+MAX_HISTORY_MESSAGES = int(os.environ.get("MAX_HISTORY_MESSAGES", "14"))  # сколько последних сообщений на чат храним и передаём модели (было 40 — дорого)
 
 
 def _load_conversations() -> dict:
@@ -283,14 +285,14 @@ def _web_search_tool() -> dict:
     return {"type": "web_search_20250305", "name": "web_search", "max_uses": WEB_SEARCH_MAX_USES}
 
 
-async def _create(system: str, messages: list[dict], max_tokens: int, web_search: bool):
+async def _create(system: str, messages: list[dict], max_tokens: int, web_search: bool, model: str | None = None):
     """Запрос к Claude с (необязательным) поиском в интернете.
 
     Возвращает (текст, stop_reason, источники). Поиск идёт на стороне Anthropic: модель сама решает,
     искать или нет. Долгий поиск API может поставить на паузу (pause_turn) — тогда продолжаем.
     Если поиск выключен в организации Anthropic (400), повторяем запрос без него.
     """
-    kwargs = {"model": CLAUDE_MODEL, "max_tokens": max_tokens, "system": _system_blocks(system)}
+    kwargs = {"model": model or CLAUDE_MODEL, "max_tokens": max_tokens, "system": _system_blocks(system)}
     use_search = web_search and WEB_SEARCH_ENABLED
     msgs = _cache_last_message(list(messages))
     texts: list[str] = []
@@ -301,8 +303,12 @@ async def _create(system: str, messages: list[dict], max_tokens: int, web_search
                 response = await client.messages.create(messages=msgs, tools=[_web_search_tool()], **kwargs)
             else:
                 response = await client.messages.create(messages=msgs, **kwargs)
-        except anthropic.BadRequestError as e:
-            if use_search and "web" in str(e).lower() and "search" in str(e).lower():
+        except (anthropic.NotFoundError, anthropic.BadRequestError) as e:
+            if kwargs["model"] != CLAUDE_MODEL and "model" in str(e).lower():
+                logger.warning("Быстрая модель %s недоступна, отвечаю основной: %s", kwargs["model"], e)
+                kwargs["model"] = CLAUDE_MODEL
+                continue
+            if isinstance(e, anthropic.BadRequestError) and use_search and "web" in str(e).lower() and "search" in str(e).lower():
                 logger.warning("Web search недоступен, отвечаю без него: %s", e)
                 use_search = False
                 continue
@@ -349,6 +355,7 @@ async def ask_claude(
     send: bool = True,
     edit: bool = True,
     history_reply=None,
+    model: str | None = None,
 ) -> str | None:
     """Единая точка общения с Claude. Возвращает полный ответ (или None при ошибке).
 
@@ -371,7 +378,7 @@ async def ask_claude(
         try:
             system = system_with_search() if (web_search and WEB_SEARCH_ENABLED) else current_system_prompt()
             reply_text, stop_reason, sources = await _create(
-                system, messages, max_tokens or CLAUDE_MAX_TOKENS, web_search
+                system, messages, max_tokens or CLAUDE_MAX_TOKENS, web_search, model=model
             )
             if edit and stop_reason != "max_tokens" and needs_editing(reply_text):
                 reply_text = await edit_draft(reply_text, max_tokens or CLAUDE_MAX_TOKENS)
@@ -430,9 +437,9 @@ def needs_editing(text: str) -> bool:
 
 async def fix_lint_issues(text: str, max_tokens: int) -> str:
     """Третий шаг: код находит выдуманные эпизоды и цепочки повторов — модель точечно их исправляет.
-    Делаем до 2 раундов; если что-то идёт не так — возвращаем текст как есть."""
+    Один раунд (раньше было два — экономим); если что-то идёт не так — возвращаем текст как есть."""
     facts_text = facts.prompt_block(DATA_DIR)
-    for round_no in (1, 2):
+    for round_no in (1,):
         issues = lint.find_issues(text, facts_text)
         if not issues:
             return text
@@ -858,6 +865,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 SCRIPT_INTENT_RE = re.compile(r"(сценари|рилс|reels|хук|ролик|подпис\w*\s+к\s+пост|что\s+снять|идеи\s+для\s+(видео|контента))", re.I)
 
 
+CONTENT_ASK_RE = re.compile(
+    r"(напиш|придума|сочин|пост|текст|подпис|сторис|stories|рилс|reels|карусел|контент|хук|сценари|"
+    r"идеи|идею|план|стратег|воронк|прогрев|запуск|продаж|оффер|разбер|разбор|проанализ|анализ|аудит|"
+    r"перепиш|переделай|исправ|улучш|сократ|короче|длиннее|ещё вариант|еще вариант|другой вариант|вариант)",
+    re.I,
+)
+
+
+def is_simple_question(chat_id: int, user_text: str) -> bool:
+    """Простой вопрос → дешёвая модель. Всё, что похоже на работу с контентом, и любые
+    правки сразу после контента — основная модель, чтобы не терять качество."""
+    if not FAST_MODEL or FAST_MODEL.lower() in ("off", "0", "none") or FAST_MODEL == CLAUDE_MODEL:
+        return False
+    text = user_text.strip()
+    if len(text) > 300 or CONTENT_ASK_RE.search(text):
+        return False
+    history = conversations.get(chat_id, [])
+    last_bot = next((m for m in reversed(history) if m.get("role") == "assistant"), None)
+    if last_bot:
+        prev = last_bot.get("content")
+        prev = prev if isinstance(prev, str) else ""
+        if len(prev) > 1200 or CONTENT_MARKERS_RE.search(prev):
+            return False  # только что был пост/сценарий — правки к нему делает основная модель
+    return True
+
+
 async def process_user_text(update: Update, user_text: str) -> None:
     """Общая обработка текста — и набранного, и распознанного из голосового/кружка."""
     chat_id = update.effective_chat.id
@@ -888,7 +921,8 @@ async def process_user_text(update: Update, user_text: str) -> None:
             await ask_claude(update, chat_id, user_text + SCRIPT_FORMAT_NOTE, history_note=user_text,
                              max_tokens=8000, web_search=True)
             return
-        await ask_claude(update, chat_id, user_text, web_search=True)
+        await ask_claude(update, chat_id, user_text, web_search=True,
+                         model=FAST_MODEL if is_simple_question(chat_id, user_text) else None)
         return
 
     # Ссылка на профиль Instagram — аудит аккаунта
