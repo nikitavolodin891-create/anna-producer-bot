@@ -224,6 +224,61 @@ async def send_long(update: Update, text: str) -> None:
 # ---------------------------------------------------------------------------
 # Общение с Claude
 # ---------------------------------------------------------------------------
+# Кэширование промпта: большая неизменная инструкция (prompt.py, ~15–20 тыс. токенов) и история
+# переписки кэшируются на стороне Anthropic. Повторное чтение из кэша стоит 10% от обычной цены,
+# запись в кэш — 125% (TTL 5 минут, продлевается при каждом попадании) или 200% (TTL 1 час).
+# Выключить: PROMPT_CACHE=0. Час вместо 5 минут: PROMPT_CACHE_TTL=1h.
+PROMPT_CACHE = os.environ.get("PROMPT_CACHE", "1") != "0"
+PROMPT_CACHE_TTL = os.environ.get("PROMPT_CACHE_TTL", "5m")
+
+
+def _cache_control() -> dict:
+    cc = {"type": "ephemeral"}
+    if PROMPT_CACHE_TTL == "1h":
+        cc["ttl"] = "1h"
+    return cc
+
+
+def _system_blocks(system: str):
+    """Системный промпт как блок с меткой кэша (или как есть, если кэш выключен)."""
+    if not PROMPT_CACHE or not system:
+        return system
+    return [{"type": "text", "text": system, "cache_control": _cache_control()}]
+
+
+def _cache_last_message(messages: list[dict]) -> list[dict]:
+    """Ставит метку кэша на последнее сообщение пользователя: на следующем запросе
+    вся история до него читается из кэша. Исходный список не меняем."""
+    if not PROMPT_CACHE or not messages or messages[-1].get("role") != "user":
+        return messages
+    msgs = list(messages)
+    content = msgs[-1]["content"]
+    if isinstance(content, str):
+        if not content.strip():
+            return messages
+        blocks = [{"type": "text", "text": content}]
+    elif isinstance(content, list) and content:
+        blocks = [dict(b) if isinstance(b, dict) else b for b in content]
+        if not isinstance(blocks[-1], dict) or blocks[-1].get("type") not in ("text", "image", "document"):
+            return messages
+    else:
+        return messages
+    blocks[-1] = {**blocks[-1], "cache_control": _cache_control()}
+    msgs[-1] = {**msgs[-1], "content": blocks}
+    return msgs
+
+
+def _log_usage(where: str, response) -> None:
+    u = getattr(response, "usage", None)
+    if u is None:
+        return
+    logger.info(
+        "Токены [%s]: вход %s, из кэша %s, в кэш %s, выход %s", where,
+        getattr(u, "input_tokens", 0), getattr(u, "cache_read_input_tokens", 0) or 0,
+        getattr(u, "cache_creation_input_tokens", 0) or 0, getattr(u, "output_tokens", 0),
+    )
+
+
 def _web_search_tool() -> dict:
     return {"type": "web_search_20250305", "name": "web_search", "max_uses": WEB_SEARCH_MAX_USES}
 
@@ -235,9 +290,9 @@ async def _create(system: str, messages: list[dict], max_tokens: int, web_search
     искать или нет. Долгий поиск API может поставить на паузу (pause_turn) — тогда продолжаем.
     Если поиск выключен в организации Anthropic (400), повторяем запрос без него.
     """
-    kwargs = {"model": CLAUDE_MODEL, "max_tokens": max_tokens, "system": system}
+    kwargs = {"model": CLAUDE_MODEL, "max_tokens": max_tokens, "system": _system_blocks(system)}
     use_search = web_search and WEB_SEARCH_ENABLED
-    msgs = list(messages)
+    msgs = _cache_last_message(list(messages))
     texts: list[str] = []
     sources: dict[str, str] = {}
     for _ in range(4):
@@ -252,6 +307,7 @@ async def _create(system: str, messages: list[dict], max_tokens: int, web_search
                 use_search = False
                 continue
             raise
+        _log_usage("ответ", response)
         for block in response.content:
             if block.type == "text":
                 texts.append(block.text)
@@ -385,7 +441,7 @@ async def fix_lint_issues(text: str, max_tokens: int) -> str:
             resp = await client.messages.create(
                 model=CLAUDE_MODEL,
                 max_tokens=max_tokens,
-                system=FIXER_PROMPT + _editor_facts(),
+                system=_system_blocks(FIXER_PROMPT + _editor_facts()),
                 messages=[{"role": "user", "content": "ПРОБЛЕМЫ:\n" + "\n".join(f"{i+1}. {x}" for i, x in enumerate(issues))
                            + f"\n\nТЕКСТ:\n\n{text}"}],
             )
@@ -417,7 +473,7 @@ async def edit_draft(draft: str, max_tokens: int) -> str:
         resp = await client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=max_tokens,
-            system=EDITOR_PROMPT + _editor_facts(),
+            system=_system_blocks(EDITOR_PROMPT + _editor_facts()),
             messages=[{"role": "user", "content": f"ЧЕРНОВИК:\n\n{body}"}],
         )
         edited = "".join(b.text for b in resp.content if b.type == "text").strip()
