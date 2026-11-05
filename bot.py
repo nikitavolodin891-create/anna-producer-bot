@@ -20,6 +20,7 @@ import anthropic
 from openai import AsyncOpenAI
 
 from prompt import BOT_CAPABILITIES
+from prompt import HITS_PROMPT
 from prompt import SYSTEM_PROMPT as ANNA_PROMPT, LINK_ANALYSIS_PROMPT, VIDEO_REVIEW_PROMPT, AUDIT_PROMPT, TRENDS_PROMPT, EDITOR_PROMPT, SCRIPT_FORMAT_NOTE, FIXER_PROMPT, CAROUSEL_PROMPT, WEB_SEARCH_NOTE
 import social
 import audit
@@ -567,60 +568,40 @@ def guarded(handler):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Привет! Я Анна — твой ИИ-продюсер для Instagram @anyalakshmi ✨\n\n"
-        "Что я умею:\n"
-        "• Идеи, хуки и сценарии Reels в твоём голосе\n"
-        "• Подписи к постам, разбор того, что заходит\n"
-        "• Анализирую твой Инстаграм и аккаунты конкурентов (кинь ссылку на профиль)\n"
-        "• Нахожу, что сейчас в тренде в нише, и пишу хуки под тебя\n"
-        "• Разбираю скриншоты статистики (досмотры, сохранения)\n"
-        "• Отвечаю на любые вопросы — про контент, бизнес и просто жизнь\n"
-        "• Понимаю голосовые и кружки 🎙\n"
-        "• Разбираю рилсы и посты по ссылке (Instagram, TikTok, YouTube)\n"
-        "• Читаю фото, PDF и сайты\n"
-        "• Делаю карусели — готовые картинки-слайды + подпись 🖼 Дизайн опиши словами, пришли скрин-пример или своё фото для обложки\n"
-        "• Ищу в интернете свежее: цены, адреса, новости 🔎\n"
-        "• Разбираю твои видео: пришли ролик — скажу, что с хуком и что улучшить 🎬\n"
-        "• Монтирую рилсы: пришли видео (можно несколько) → вырежу паузы, склею, сделаю субтитры и хук ✂️\n"
-        "• Утренняя сводка: напиши «Привет, я проснулась» — расскажу, что изменилось в инсте ☀️\n\n"
-        "Просто напиши или наговори, что нужно. Полный список с примерами — /help\n"
-        "/trends — что сейчас залетает в нише + 15 хуков для тебя\n"
-        "/audit — аудит твоего Инстаграма (или /audit @ник — любого аккаунта)\n"
-        "/carousel тема — карусель-картинки для Instagram (дизайн — любыми словами или по скрину)\n"
-        "/designs — показать готовые дизайны каруселей\n"
-        "/competitors — аккаунты-ориентиры для трендов\n"
+        "Как со мной работать:\n"
+        "1️⃣ Напиши «Привет, что по Инстаграму?» — расскажу, сколько подписчиков, что просело и почему\n"
+        "2️⃣ Скажи «Давай исправим» — найду ролики, которые залетели у конкурентов, и дам хук и сценарий по их механике (и объясню, почему именно так)\n"
+        "3️⃣ Сними и смонтируй ролик, пришли мне готовое видео — проверю перед публикацией: что оставить, что поправить 🎬\n\n"
+        "Ещё умею:\n"
+        "• Разбираю рилсы и профили по ссылке (Instagram, TikTok, YouTube)\n"
+        "• Отвечаю на любые вопросы и ищу свежее в интернете 🔎\n"
+        "• Понимаю голосовые и кружки 🎙, читаю фото, скрины статистики, PDF\n\n"
+        "/audit — подробный аудит Инстаграма (или /audit @ник)\n"
+        "/trends — что сейчас залетает в нише\n"
+        "/competitors — аккаунты-ориентиры (добавить: /competitors @ник)\n"
         "/memory — что я о тебе помню (добавить: «Запомни: …»)\n"
-        "/new — начать новый диалог (забыть контекст)"
+        "/new — начать новый диалог\n"
+        "/help — подробнее"
     )
 
 
 HELP_TEXT = (
-    "✨ <b>Что я умею</b>\n\n"
-    "<b>Карусели</b>\n"
-    "• «сделай карусель про …» или /carousel тема\n"
-    "• Из своих фото: выдели несколько фото, отправь одним сообщением и подпиши «сделай из этого карусель про …»\n"
-    "• С фото из Instagram: «сделай карусель про …, возьми фото из моей инсты»\n"
-    "• Дизайн словами: «в стиле old money», «бордовый с золотом», «как море»\n"
-    "• Готовые стили: /designs · по примеру: скрин чужой карусели + «в таком стиле»\n"
-    "• Рисунок: «сверху нарисуй пальму» · нейрофон: «с нейрофоном: вилла на закате»\n"
-    "• Понравилось — «запомни дизайн как мой стиль», потом «карусель в дизайне мой стиль»\n"
-    "• Правки: «поменяй слайд 3 на …», «перерисуй темнее»\n\n"
-    "<b>Монтаж рилсов ✂️</b>\n"
-    "• Пришли одно или несколько видео → «🎬 Смонтировать рилс» или «смонтируй рилс до 40 секунд»\n"
-    "• Вырежу паузы и «эээ», выберу лучшие дубли, склею, сделаю субтитры и хук сверху\n"
-    "• Музыка: пришли трек с подписью «музыка» — добавлю фоном\n"
-    "• Правки: «короче», «другой хук», «без субтитров», «начни с фразы про …»\n\n"
-    "<b>Instagram</b>\n"
-    "• «Привет, я проснулась» / «какая обстановка в инсте?» — утренняя сводка: что изменилось и что снять сегодня\n"
-    "• /audit — аудит твоего аккаунта, /audit @ник — любого открытого\n"
-    "• Ссылка на рилс или пост — разберу, почему залетел\n"
-    "• /trends — что сейчас залетает в нише + хуки, /competitors — ориентиры\n"
-    "• Скрин статистики (охваты, досмотры) — разберу цифры\n\n"
-    "<b>Тексты и идеи</b>\n"
-    "• Сценарии рилс, хуки, подписи в твоём голосе, проверка и правка текстов\n"
-    "• «Запомни: …» — запомню факт или историю, /memory — что я помню\n\n"
+    "✨ <b>Как со мной работать</b>\n\n"
+    "<b>1. Что по Инстаграму</b>\n"
+    "• «Привет, что по Инстаграму?» / «я проснулась» — сводка: подписчики, что просело и почему\n"
+    "• /audit — подробный аудит аккаунта, /audit @ник — любого открытого\n\n"
+    "<b>2. Давай исправим</b>\n"
+    "• «Давай исправим», «что снять?», «сценарий как у конкурентов» — найду залетевшие ролики ниши и конкурентов и дам хук + сценарий по их механике\n"
+    "• Объясню, что в сценарии нельзя менять, чтобы ролик сработал\n"
+    "• /competitors @ник — добавить аккаунт-ориентир (чем точнее ориентиры, тем точнее сценарии)\n\n"
+    "<b>3. Проверка перед публикацией 🎬</b>\n"
+    "• Сними и смонтируй сама (или монтажёр) → пришли готовое видео\n"
+    "• Скажу: можно публиковать / доработать / переснять, по секундам что поправить и какую подпись поставить\n\n"
     "<b>Ещё</b>\n"
-    "• Голосовые и кружки 🎙 · видео-разбор: пришли ролик 🎬\n"
-    "• Поиск в интернете: цены, адреса, новости 🔎 · фото, PDF, сайты\n"
+    "• Ссылка на рилс или пост — разберу, почему залетел · /trends — что залетает в нише\n"
+    "• Скрин статистики — разберу цифры · фото, PDF, сайты\n"
+    "• Голосовые и кружки 🎙 · поиск в интернете 🔎 · любые вопросы\n"
+    "• «Запомни: …» — запомню факт, /memory — что я помню\n"
     "• /new — начать диалог заново"
 )
 
@@ -734,6 +715,8 @@ async def run_audit(update: Update, handle: str, extra: str = "") -> None:
 
     note = summary[:7000] + f"\n\n[Аудит аккаунта @{handle}]"
     reply = await ask_claude(update, update.effective_chat.id, content, history_note=note, max_tokens=8000)
+    if reply:
+        _mark_mode(update.effective_chat.id, "audit")
     if reply and is_client:
         m = MEMORY_RE.search(reply)
         memory = m.group(1).strip() if m else ""
@@ -944,6 +927,9 @@ async def process_user_text(update: Update, user_text: str) -> None:
             return
         if kind == "new":
             await run_montage(update, user_text, _pending_videos.pop(chat_id, None) or recent_videos(chat_id))
+            return
+        if HITS_INTENT_RE.search(user_text) or (YES_RE.match(user_text) and _recent_mode(chat_id) in ("brief", "audit")):
+            await run_hits(update, "" if YES_RE.match(user_text) else user_text)
             return
         if BRIEF_INTENT_RE.search(user_text) and not AUDIT_INTENT_RE.search(user_text):
             await run_brief(update, user_text)
@@ -1663,6 +1649,64 @@ async def save_telegram_file(tg_file, dst: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# «Давай исправим» → сценарии по механике залетевших роликов ниши и конкурентов
+# ---------------------------------------------------------------------------
+HITS_INTENT_RE = re.compile(
+    r"(давай\s+(это\s+)?(исправ|сним|снима|переделыва)|как\s+(это\s+|всё\s+|все\s+)?исправ|что\s+(мне\s+)?(снять|снимать)|"
+    r"какой\s+(рилс|ролик)\s+(снять|снимать)|как\s+у\s+конкурент|у\s+конкурентов|залетевш|миллионник|"
+    r"сценари\w*\s+(по|как\s+у)\s+(залет|конкурент|хит|тренд|вирус)|что\s+залета\w*\s+у)",
+    re.I,
+)
+YES_RE = re.compile(r"^\s*(да|давай|го|ок|окей|хочу|погнали|конечно|ага|давай исправим|да,?\s*давай)[\s!.,)]*$", re.I)
+_last_mode: dict[int, tuple[str, float]] = {}
+
+
+def _mark_mode(chat_id: int, mode: str) -> None:
+    _last_mode[chat_id] = (mode, asyncio.get_event_loop().time())
+
+
+def _recent_mode(chat_id: int, within: float = 1800) -> str | None:
+    m = _last_mode.get(chat_id)
+    if m and asyncio.get_event_loop().time() - m[1] < within:
+        return m[0]
+    return None
+
+
+async def run_hits(update: Update, topic: str = "") -> None:
+    chat_id = update.effective_chat.id
+    status = await update.effective_message.reply_text(
+        "🔥 Ищу ролики, которые залетели у конкурентов и в нише, и разбираю, почему. 1–3 минуты ⏳"
+    )
+    try:
+        result = await trends.collect(DATA_DIR)
+    except trends.TrendsError as e:
+        await status.edit_text(f"Не получилось найти залетевшие ролики: {e}")
+        return
+    except Exception:
+        logger.exception("Hits error")
+        await status.edit_text("Не получилось найти залетевшие ролики. Попробуй ещё раз через пару минут.")
+        return
+    try:
+        await status.edit_text(f"✅ Нашла {len(result['rows'])} залетевших роликов. Разбираю механику и пишу сценарии…")
+    except BadRequest:
+        pass
+    summary = trends.trends_text(result)
+    content: list[dict] = [{"type": "text", "text": summary}]
+    for label, data_bytes, mime in await trends.covers(result):
+        content.append({"type": "text", "text": f"Обложка {label}"})
+        content.append(social.image_block(data_bytes, mime))
+    topic_line = f"\n\nЗапрос Анны: {topic.strip()[:300]}" if topic.strip() else ""
+    content.append({"type": "text", "text": HITS_PROMPT.format(topic=topic_line)})
+    note = summary[:7000] + "\n\n[Сценарии по залетевшим роликам]" + (f" {topic.strip()[:200]}" if topic.strip() else "")
+    reply = await ask_claude(update, chat_id, content, history_note=note, max_tokens=8000)
+    if reply:
+        _mark_mode(chat_id, "hits")
+        m = MEMORY_RE.search(reply)
+        if m:
+            audit.save_audit(DATA_DIR, "__trends__", m.group(1).strip())
+
+
+# ---------------------------------------------------------------------------
 # Утренняя сводка: «Привет, я проснулась», «какая обстановка в инсте?»
 # ---------------------------------------------------------------------------
 BRIEF_INTENT_RE = re.compile(
@@ -1692,8 +1736,8 @@ BRIEF_PROMPT = """Сделай Анне утреннюю сводку по её 
      фразы связаны между собой («и вот что я заметила…», «а потом…»), без рубленых лозунгов и без телеграфного стиля;
    - **Формат** — говорящая голова / практика в кадре / текст на экране, длительность.
    Опирайся на то, что заходит у неё по цифрам (формат и тему хитов), но не повторяй их дословно.
-6. В конце — 1–2 вопроса Анне, чтобы продолжить разговор (например: снимаем этот рилс? что у тебя сегодня по планам?
-   хочешь, разберу, почему просел конкретный ролик?).
+6. В конце — вопрос-следующий шаг, обязательно такой: «Давай исправим? Найду ролики, которые залетели у конкурентов,
+   и сделаю сценарий по их механике». Можно добавить второй короткий вопрос (например, разобрать конкретный провал).
 
 ЖЁСТКИЕ ПРАВИЛА:
 - Говори ТОЛЬКО о том, что есть в данных: подписчики, просмотры, лайки, комментарии, даты, подписи.
@@ -1742,7 +1786,8 @@ async def run_brief(update: Update, text: str) -> None:
             pass
     content = facts_text + "\n\n" + BRIEF_PROMPT.format(text=text.strip()[:300])
     note = facts_text[:5000] + f"\n\n[Утренняя сводка по запросу Анны: {text.strip()[:200]}]"
-    await ask_claude(update, chat_id, content, history_note=note, max_tokens=2500)
+    if await ask_claude(update, chat_id, content, history_note=note, max_tokens=2500):
+        _mark_mode(chat_id, "brief")
 
 
 # ---------------------------------------------------------------------------
@@ -1751,7 +1796,7 @@ async def run_brief(update: Update, text: str) -> None:
 MEDIA_DIR = os.environ.get("MEDIA_DIR", "/tmp/anna-media")
 MEDIA_TTL = int(os.environ.get("MEDIA_TTL", str(3 * 3600)))
 VIDEO_BATCH_WAIT = 4.0
-MONTAGE_ENABLED = os.environ.get("MONTAGE_ENABLED", "1") != "0"
+MONTAGE_ENABLED = os.environ.get("MONTAGE_ENABLED", "0") == "1"  # монтаж выключен: видео идёт на проверку перед публикацией
 MONTAGE_RE = re.compile(
     r"(смонтир|монтаж|монтируй|склей|склеи|нарежь|собери\s+(мне\s+)?(рилс|ролик|видео)|"
     r"(сделай|сделать|собери)\s+(мне\s+)?(из\s+(них|этого|этих|видео)\s+)?(рилс|reels|ролик)|"
@@ -1870,7 +1915,7 @@ async def _flush_videos(chat_id: int) -> None:
     try:
         if caption and MONTAGE_RE.search(caption) and MONTAGE_ENABLED:
             await run_montage(update, caption, paths)
-        elif caption:
+        elif caption or not MONTAGE_ENABLED:
             await review_videos(update, paths, caption)
         else:
             _pending_videos[chat_id] = paths
@@ -1912,7 +1957,7 @@ async def on_video_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def review_videos(update: Update, paths: list[str], caption: str) -> None:
     """Продюсерский разбор одного или нескольких роликов (речь + кадры) — одним ответом."""
-    status = await update.effective_message.reply_text("🎬 Смотрю и слушаю ролик… Это займёт до минуты ⏳")
+    status = await update.effective_message.reply_text("🎬 Смотрю и слушаю ролик — проверю перед публикацией. Это займёт до минуты ⏳")
     await update.effective_chat.send_action("typing")
     paths = paths[:6]
     per_clip = max(2, social.MAX_FRAMES // len(paths)) if len(paths) > 1 else social.MAX_FRAMES
@@ -1923,19 +1968,30 @@ async def review_videos(update: Update, paths: list[str], caption: str) -> None:
             summary_lines.append(f"[Видео {i}: {duration / 60:.0f} мин — слишком длинное, пропускаю]")
             continue
         frames = await social.extract_frames(path, count=per_clip)
+        if duration >= 3:
+            step = (duration - 0.6) / max(per_clip - 1, 1)
+            frame_times = [0.3 + k * step for k in range(len(frames))]
+        else:
+            frame_times = [duration / 2] * len(frames)
         transcript = ""
         if openai_client is not None:
+            mp3 = path + ".review.mp3"
             try:
-                audio = await extract_audio_mp3_from_path(path)
-                if audio:
-                    transcript = await transcribe(audio, "audio.mp3")
+                if await montage.extract_audio(path, mp3) and os.path.getsize(mp3) <= WHISPER_MAX_BYTES:
+                    _, segs = await montage.transcribe_words(openai_client, mp3)
+                    transcript = "\n".join(f"[{sg['start']:.1f}–{sg['end']:.1f} с] {sg['text']}" for sg in segs)
             except Exception:
                 logger.exception("Video transcription error")
+            finally:
+                try:
+                    os.remove(mp3)
+                except OSError:
+                    pass
         label = f"Видео {i} · {duration:.0f} сек" if len(paths) > 1 else f"Видео от Анны · {duration:.0f} сек"
         summary_lines.append(f"[{label}]\nРасшифровка речи:\n{transcript[:5000]}" if transcript
                              else f"[{label}] Речи нет (или не распознана) — смысл в картинке и тексте на экране.")
-        for fr in frames:
-            images.append((label, fr))
+        for fr, ft in zip(frames, frame_times):
+            images.append((label, fr, ft))
     if not images and not any("Расшифровка" in s for s in summary_lines):
         await status.edit_text("Не получилось разобрать видео — возможно, файл повреждён. Попробуй другой.")
         return
@@ -1946,14 +2002,15 @@ async def review_videos(update: Update, paths: list[str], caption: str) -> None:
     summary = "\n\n".join(summary_lines)
     content: list[dict] = [{"type": "text", "text": summary}]
     last_label = None
-    for label, fr in images:
+    for label, fr, ft in images:
         if label != last_label:
             content.append({"type": "text", "text": f"Кадры: {label} (по порядку, первый — хук)"})
             last_label = label
+        content.append({"type": "text", "text": f"кадр на {ft:.1f} с"})
         content.append(social.image_block(fr))
-    content.append({"type": "text", "text": caption or VIDEO_REVIEW_PROMPT})
-    note = summary[:6000] + (f"\n\n{caption}" if caption else "\n\n[Разбери моё видео]")
-    await ask_claude(update, update.effective_chat.id, content, history_note=note)
+    content.append({"type": "text", "text": VIDEO_REVIEW_PROMPT + (f"\n\nПодпись/вопрос Анны к видео: {caption}" if caption else "")})
+    note = summary[:6000] + (f"\n\n{caption}" if caption else "\n\n[Проверь моё видео перед публикацией]")
+    await ask_claude(update, update.effective_chat.id, content, history_note=note, max_tokens=5000)
 
 
 def _remember_in_history(chat_id: int, user_note: str, bot_note: str) -> None:
