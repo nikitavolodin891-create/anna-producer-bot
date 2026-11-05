@@ -169,6 +169,23 @@ chat_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 TELEGRAM_SAFE_LEN = 3800  # лимит Telegram — 4096 символов, держим запас под HTML-теги
 
 
+def _italics(text: str) -> str:
+    """*текст* → <i>текст</i>, но не трогает 2*3*4 и звёздочки с пробелами внутри."""
+    out, pos = [], 0
+    for m in re.finditer(r"\*([^*\n]+)\*", text):
+        a, b = m.start(), m.end()
+        before = text[a - 1] if a else " "
+        after = text[b] if b < len(text) else " "
+        inner = m.group(1)
+        if before.isalnum() or after.isalnum() or inner[0].isspace() or inner[-1].isspace():
+            continue
+        out.append(text[pos:a])
+        out.append(f"<i>{inner}</i>")
+        pos = b
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def markdown_to_telegram_html(text: str) -> str:
     """Переводит простой Markdown от Claude в HTML, который понимает Telegram."""
     text = html.escape(text, quote=False)
@@ -185,6 +202,8 @@ def markdown_to_telegram_html(text: str) -> str:
     text = re.sub(r"^(\s*)[\*\-]\s+", r"\1• ", text, flags=re.MULTILINE)
     # горизонтальные линии
     text = re.sub(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$", "", text, flags=re.MULTILINE)
+    # *курсив* (одиночные звёздочки; маркеры списков уже заменены на «•»)
+    text = _italics(text)
     return text
 
 
