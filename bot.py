@@ -76,7 +76,7 @@ SYSTEM_PROMPT = ANNA_PROMPT + FORMAT_NOTE
 # DATA_DIR указывает на подключённый в Railway Volume (переживает redeploy).
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 HISTORY_FILE = os.path.join(DATA_DIR, "conversations.json")
-MAX_HISTORY_MESSAGES = int(os.environ.get("MAX_HISTORY_MESSAGES", "14"))  # сколько последних сообщений на чат храним и передаём модели (было 40 — дорого)
+MAX_HISTORY_MESSAGES = int(os.environ.get("MAX_HISTORY_MESSAGES", "8"))  # сколько последних сообщений на чат храним и передаём модели (было 40 — дорого)
 
 
 def _load_conversations() -> dict:
@@ -429,7 +429,7 @@ async def ask_claude(
         if stop_reason == "max_tokens" and send:
             reply_text += "\n\n_(ответ обрезан по длине — напиши «продолжи», и я допишу)_"
 
-        stored = reply_text
+        stored = reply_text if len(reply_text) <= 2500 else reply_text[:2500] + "\n…[ответ сокращён в памяти]"
         if history_reply:
             try:
                 stored = history_reply(reply_text)
@@ -713,8 +713,8 @@ async def run_audit(update: Update, handle: str, extra: str = "") -> None:
         task += f"\n\nДополнительный запрос: {extra}"
     content.append({"type": "text", "text": task})
 
-    note = summary[:7000] + f"\n\n[Аудит аккаунта @{handle}]"
-    reply = await ask_claude(update, update.effective_chat.id, content, history_note=note, max_tokens=8000)
+    note = summary[:2000] + f"\n\n[Аудит аккаунта @{handle}]"
+    reply = await ask_claude(update, update.effective_chat.id, content, history_note=note, max_tokens=6000, edit=False)
     if reply:
         _mark_mode(update.effective_chat.id, "audit")
     if reply and is_client:
@@ -796,14 +796,14 @@ async def run_trends(update: Update, hashtags: list[str] | None = None, topic: s
 
     summary = trends.trends_text(result)
     content: list[dict] = [{"type": "text", "text": summary}]
-    for label, data_bytes, mime in await trends.covers(result):
+    for label, data_bytes, mime in await trends.covers(result, limit=3):
         content.append({"type": "text", "text": f"Обложка {label}"})
         content.append(social.image_block(data_bytes, mime))
     topic_line = f"\n\nЗапрос Анны: {topic}" if topic else ""
     content.append({"type": "text", "text": TRENDS_PROMPT.format(topic=topic_line)})
 
-    note = summary[:7000] + "\n\n[Тренды ниши и хуки]" + (f" {topic}" if topic else "")
-    reply = await ask_claude(update, update.effective_chat.id, content, history_note=note, max_tokens=8000)
+    note = summary[:2000] + "\n\n[Тренды ниши и хуки]" + (f" {topic}" if topic else "")
+    reply = await ask_claude(update, update.effective_chat.id, content, history_note=note, max_tokens=6000, edit=False)
     if reply:
         m = MEMORY_RE.search(reply)
         if m:
@@ -1523,8 +1523,8 @@ async def process_social_link(update: Update, user_text: str, platform: str, url
     content.append({"type": "text", "text": task})
 
     # В историю — текстовая сводка (без картинок), чтобы можно было продолжить: «а ещё вариант?»
-    note = summary[:8000] + (f"\n\n{request}" if len(request) >= 3 else "\n\n[Разбери этот пост]")
-    await ask_claude(update, update.effective_chat.id, content, history_note=note)
+    note = summary[:2000] + (f"\n\n{request}" if len(request) >= 3 else "\n\n[Разбери этот пост]")
+    await ask_claude(update, update.effective_chat.id, content, history_note=note, edit=False)
 
 
 # ---------------------------------------------------------------------------
@@ -1699,13 +1699,13 @@ async def run_hits(update: Update, topic: str = "") -> None:
         pass
     summary = trends.trends_text(result)
     content: list[dict] = [{"type": "text", "text": summary}]
-    for label, data_bytes, mime in await trends.covers(result):
+    for label, data_bytes, mime in await trends.covers(result, limit=3):
         content.append({"type": "text", "text": f"Обложка {label}"})
         content.append(social.image_block(data_bytes, mime))
     topic_line = f"\n\nЗапрос Анны: {topic.strip()[:300]}" if topic.strip() else ""
     content.append({"type": "text", "text": HITS_PROMPT.format(topic=topic_line)})
-    note = summary[:7000] + "\n\n[Сценарии по залетевшим роликам]" + (f" {topic.strip()[:200]}" if topic.strip() else "")
-    reply = await ask_claude(update, chat_id, content, history_note=note, max_tokens=8000)
+    note = summary[:2000] + "\n\n[Сценарии по залетевшим роликам]" + (f" {topic.strip()[:200]}" if topic.strip() else "")
+    reply = await ask_claude(update, chat_id, content, history_note=note, max_tokens=5000, edit=False)
     if reply:
         _mark_mode(chat_id, "hits")
         m = MEMORY_RE.search(reply)
@@ -1788,8 +1788,8 @@ async def run_brief(update: Update, text: str) -> None:
         except BadRequest:
             pass
     content = facts_text + "\n\n" + BRIEF_PROMPT.format(text=text.strip()[:300])
-    note = facts_text[:5000] + f"\n\n[Утренняя сводка по запросу Анны: {text.strip()[:200]}]"
-    if await ask_claude(update, chat_id, content, history_note=note, max_tokens=2500):
+    note = facts_text[:2000] + f"\n\n[Утренняя сводка по запросу Анны: {text.strip()[:200]}]"
+    if await ask_claude(update, chat_id, content, history_note=note, max_tokens=2500, edit=False):
         _mark_mode(chat_id, "brief")
 
 
@@ -2012,8 +2012,8 @@ async def review_videos(update: Update, paths: list[str], caption: str) -> None:
         content.append({"type": "text", "text": f"кадр на {ft:.1f} с"})
         content.append(social.image_block(fr))
     content.append({"type": "text", "text": VIDEO_REVIEW_PROMPT + (f"\n\nПодпись/вопрос Анны к видео: {caption}" if caption else "")})
-    note = summary[:6000] + (f"\n\n{caption}" if caption else "\n\n[Проверь моё видео перед публикацией]")
-    await ask_claude(update, update.effective_chat.id, content, history_note=note, max_tokens=5000)
+    note = summary[:2000] + (f"\n\n{caption}" if caption else "\n\n[Проверь моё видео перед публикацией]")
+    await ask_claude(update, update.effective_chat.id, content, history_note=note, max_tokens=4000, edit=False)
 
 
 def _remember_in_history(chat_id: int, user_note: str, bot_note: str) -> None:
