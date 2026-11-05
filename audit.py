@@ -63,11 +63,11 @@ async def _apify(payload: dict, timeout: int = 300) -> list[dict]:
     return data if isinstance(data, list) else []
 
 
-async def fetch_account(handle: str) -> dict:
+async def fetch_account(handle: str, limit: int | None = None) -> dict:
     """Профиль + последние публикации."""
     url = f"https://www.instagram.com/{handle}/"
     details_task = _apify({"directUrls": [url], "resultsType": "details", "resultsLimit": 1, "addParentData": False})
-    posts_task = _apify({"directUrls": [url], "resultsType": "posts", "resultsLimit": AUDIT_POSTS, "addParentData": False})
+    posts_task = _apify({"directUrls": [url], "resultsType": "posts", "resultsLimit": limit or AUDIT_POSTS, "addParentData": False})
     details, posts = await asyncio.gather(details_task, posts_task, return_exceptions=True)
     if isinstance(posts, Exception):
         raise posts if isinstance(posts, AuditError) else AuditError(f"не получилось выгрузить публикации: {str(posts)[:150]}")

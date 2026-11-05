@@ -15,7 +15,7 @@ from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import anthropic
 from openai import AsyncOpenAI
 
@@ -28,8 +28,10 @@ import facts
 import lint
 import carousel
 import design_store
+import montage
+import brief
 import datetime
-from telegram import InputMediaPhoto, InputMediaDocument
+from telegram import InputMediaPhoto, InputMediaDocument, InlineKeyboardButton, InlineKeyboardMarkup
 
 logging.basicConfig(level=logging.INFO)
 # httpx пишет в лог каждый запрос к Telegram вместе с токеном бота в URL — глушим
@@ -558,7 +560,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Читаю фото, PDF и сайты\n"
         "• Делаю карусели — готовые картинки-слайды + подпись 🖼 Дизайн опиши словами, пришли скрин-пример или своё фото для обложки\n"
         "• Ищу в интернете свежее: цены, адреса, новости 🔎\n"
-        "• Разбираю твои видео: пришли ролик — скажу, что с хуком и что улучшить 🎬\n\n"
+        "• Разбираю твои видео: пришли ролик — скажу, что с хуком и что улучшить 🎬\n"
+        "• Монтирую рилсы: пришли видео (можно несколько) → вырежу паузы, склею, сделаю субтитры и хук ✂️\n"
+        "• Утренняя сводка: напиши «Привет, я проснулась» — расскажу, что изменилось в инсте ☀️\n\n"
         "Просто напиши или наговори, что нужно. Полный список с примерами — /help\n"
         "/trends — что сейчас залетает в нише + 15 хуков для тебя\n"
         "/audit — аудит твоего Инстаграма (или /audit @ник — любого аккаунта)\n"
@@ -581,7 +585,13 @@ HELP_TEXT = (
     "• Рисунок: «сверху нарисуй пальму» · нейрофон: «с нейрофоном: вилла на закате»\n"
     "• Понравилось — «запомни дизайн как мой стиль», потом «карусель в дизайне мой стиль»\n"
     "• Правки: «поменяй слайд 3 на …», «перерисуй темнее»\n\n"
+    "<b>Монтаж рилсов ✂️</b>\n"
+    "• Пришли одно или несколько видео → «🎬 Смонтировать рилс» или «смонтируй рилс до 40 секунд»\n"
+    "• Вырежу паузы и «эээ», выберу лучшие дубли, склею, сделаю субтитры и хук сверху\n"
+    "• Музыка: пришли трек с подписью «музыка» — добавлю фоном\n"
+    "• Правки: «короче», «другой хук», «без субтитров», «начни с фразы про …»\n\n"
     "<b>Instagram</b>\n"
+    "• «Привет, я проснулась» / «какая обстановка в инсте?» — утренняя сводка: что изменилось и что снять сегодня\n"
     "• /audit — аудит твоего аккаунта, /audit @ник — любого открытого\n"
     "• Ссылка на рилс или пост — разберу, почему залетел\n"
     "• /trends — что сейчас залетает в нише + хуки, /competitors — ориентиры\n"
@@ -906,6 +916,19 @@ async def process_user_text(update: Update, user_text: str) -> None:
 
     if await handle_design_commands(update, user_text):
         return
+
+    if not urls:
+        kind = montage_followup(chat_id, user_text)
+        if kind == "edit":
+            last = _last_montage[chat_id]
+            await run_montage(update, user_text, last["videos"], previous=last["plan"])
+            return
+        if kind == "new":
+            await run_montage(update, user_text, _pending_videos.pop(chat_id, None) or recent_videos(chat_id))
+            return
+        if BRIEF_INTENT_RE.search(user_text) and not AUDIT_INTENT_RE.search(user_text):
+            await run_brief(update, user_text)
+            return
 
     to_remember = facts.extract(user_text)
     if to_remember:
@@ -1564,6 +1587,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await msg.reply_text("Распознавание голоса не настроено (нет ключа OpenAI). Напиши, пожалуйста, текстом.")
         return
 
+    if msg.audio and (MUSIC_CAPTION_RE.search(msg.caption or "") or msg.audio.performer or msg.audio.title):
+        await save_music(update, context, msg.audio, msg.audio.file_name or "music.mp3")
+        return
     if msg.voice:
         media, filename, label = msg.voice, "voice.ogg", "голосовое"
     elif msg.video_note:
@@ -1617,73 +1643,464 @@ async def save_telegram_file(tg_file, dst: str) -> None:
         await tg_file.download_to_drive(dst)
 
 
+# ---------------------------------------------------------------------------
+# Утренняя сводка: «Привет, я проснулась», «какая обстановка в инсте?»
+# ---------------------------------------------------------------------------
+BRIEF_INTENT_RE = re.compile(
+    r"(проснул|доброе утро|обстановк|сводк|"
+    r"что\s+(там\s+)?(нового\s+)?(в|по|с)\s+(инст|инстаграм|акк|аккаунт|блог|статистик)|"
+    r"как\s+(там\s+)?(дела\s+)?(в|с|у)\s+(инст|инстаграм|акк|аккаунт|блог)|"
+    r"как\s+(мой|мои|наш)\s+(инст|акк|аккаунт|блог|рилс|охват|просмотр)|"
+    r"что\s+(там\s+)?(с\s+)?(охват|просмотр|подписчик|статистик))",
+    re.I,
+)
+BRIEF_CACHE_SECONDS = 30 * 60
+_brief_cache: dict = {}
+
+BRIEF_PROMPT = """Сделай Анне утреннюю сводку по её Instagram — как личный продюсер в Telegram, тепло и по делу.
+Выше — реальные цифры, посчитанные кодом (им можно доверять). Её сообщение: «{text}».
+
+Структура (коротко, всего до ~1600 знаков):
+1. Приветствие одной строкой — по времени суток и её сообщению.
+2. **Что изменилось** с прошлой проверки: подписчики, как растут последние публикации, что выстрелило или
+   просело — только цифры из данных. Если это первая сводка — коротко «точка отсчёта».
+3. **Обстановка** — 2–3 вывода: что сейчас работает, что нет, и почему (по конкретным публикациям).
+4. **Что изменить** — 2–3 конкретных действия на сегодня–завтра.
+5. **Рилс на сегодня** — одна идея: хук (первая фраза), формат (говорящая голова / текст на экране / практика),
+   3–4 строки что сказать или показать. Учитывай, что заходит у неё по цифрам.
+6. В конце — 1–2 вопроса Анне, чтобы продолжить разговор (например: снимаем этот рилс? что у тебя сегодня по планам?
+   хочешь, разберу, почему просел конкретный ролик?).
+
+Только русский. Не выдумывай цифры и личные истории Анны. Без таблиц."""
+
+
+async def run_brief(update: Update, text: str) -> None:
+    chat_id = update.effective_chat.id
+    handle = audit.CLIENT_INSTAGRAM
+    cached = _brief_cache.get(handle)
+    now = asyncio.get_event_loop().time()
+    if cached and now - cached["t"] < BRIEF_CACHE_SECONDS:
+        stats, prev = cached["stats"], cached["prev"]
+        status = None
+    else:
+        status = await update.effective_message.reply_text("☀️ Смотрю, что происходит в твоём Instagram… 1–2 минуты ⏳")
+        await update.effective_chat.send_action("typing")
+        try:
+            data = await audit.fetch_account(handle, limit=brief.BRIEF_POSTS)
+            stats = audit.build_stats(data)
+        except audit.AuditError as e:
+            await status.edit_text(f"Не получилось заглянуть в Instagram: {e}")
+            return
+        except Exception:
+            logger.exception("Brief fetch error")
+            await status.edit_text("Не получилось выгрузить Instagram. Попробуй ещё раз через пару минут.")
+            return
+        prev = brief.load_snapshot(DATA_DIR)
+        try:
+            brief.save_snapshot(DATA_DIR, brief.make_snapshot(stats))
+        except OSError:
+            logger.exception("Brief snapshot save error")
+        _brief_cache[handle] = {"t": now, "stats": stats, "prev": prev}
+    now_local = datetime.datetime.now(audit.LOCAL_TZ)
+    facts_text = brief.brief_text(stats, prev, now_local)
+    if status:
+        try:
+            await status.edit_text("✅ Посмотрела. Собираю сводку…")
+        except BadRequest:
+            pass
+    content = facts_text + "\n\n" + BRIEF_PROMPT.format(text=text.strip()[:300])
+    note = facts_text[:5000] + f"\n\n[Утренняя сводка по запросу Анны: {text.strip()[:200]}]"
+    await ask_claude(update, chat_id, content, history_note=note, max_tokens=2500)
+
+
+# ---------------------------------------------------------------------------
+# Видео: копим присланные ролики → разбор или автомонтаж
+# ---------------------------------------------------------------------------
+MEDIA_DIR = os.environ.get("MEDIA_DIR", "/tmp/anna-media")
+MEDIA_TTL = int(os.environ.get("MEDIA_TTL", str(3 * 3600)))
+VIDEO_BATCH_WAIT = 4.0
+MONTAGE_ENABLED = os.environ.get("MONTAGE_ENABLED", "1") != "0"
+MONTAGE_RE = re.compile(
+    r"(смонтир|монтаж|монтируй|склей|склеи|нарежь|собери\s+(мне\s+)?(рилс|ролик|видео)|"
+    r"(сделай|сделать|собери)\s+(мне\s+)?(из\s+(них|этого|этих|видео)\s+)?(рилс|reels|ролик)|"
+    r"субтитр|вырежи\s+пауз)",
+    re.I,
+)
+MONTAGE_EDIT_RE = re.compile(
+    r"(короче|длиннее|другой\s+хук|поменяй\s+хук|смени\s+хук|хук\s+|без\s+субтитр|с\s+субтитр|без\s+музык|"
+    r"музык|переставь|начни\s+с|убери|оставь\s+только|переделай|ещё\s+вариант|еще\s+вариант|другой\s+вариант|"
+    r"быстрее|динамичн|медленн|не\s+вырезай)",
+    re.I,
+)
+MUSIC_CAPTION_RE = re.compile(r"(музык|трек|фон|песн|звук\s+для)", re.I)
+
+_video_bin: dict[int, list[dict]] = defaultdict(list)   # chat -> [{path, name, ts}]
+_video_batch: dict[int, dict] = {}                       # копим пачку присланных подряд видео
+_pending_videos: dict[int, list[str]] = {}               # пачка, по которой ждём кнопку
+_video_inflight: dict[int, int] = defaultdict(int)       # сколько видео ещё скачивается
+_music_bin: dict[int, dict] = {}                         # chat -> {path, ts, name}
+_last_montage: dict[int, dict] = {}                      # chat -> {videos, plan, ts, request}
+_transcript_cache: dict[str, dict] = {}                  # path -> {probe, words, segments}
+montage_semaphore = asyncio.Semaphore(1)                 # один монтаж за раз — бережём память
+
+
+def _now() -> float:
+    return asyncio.get_event_loop().time()
+
+
+def _cleanup_media(chat_id: int) -> None:
+    t = _now()
+    keep = []
+    for v in _video_bin.get(chat_id, []):
+        if t - v["ts"] < MEDIA_TTL and os.path.exists(v["path"]):
+            keep.append(v)
+        else:
+            _transcript_cache.pop(v["path"], None)
+            try:
+                os.remove(v["path"])
+            except OSError:
+                pass
+    _video_bin[chat_id] = keep[-20:]
+    m = _music_bin.get(chat_id)
+    if m and t - m["ts"] > MEDIA_TTL:
+        _music_bin.pop(chat_id, None)
+
+
+async def _store_media(context, file_id: str, chat_id: int, name: str) -> str:
+    folder = os.path.join(MEDIA_DIR, str(chat_id))
+    os.makedirs(folder, exist_ok=True)
+    safe = re.sub(r"[^\w.\-]+", "_", name)[-60:] or "video.mp4"
+    dst = os.path.join(folder, f"{int(_now() * 1000)}_{safe}")
+    tg_file = await context.bot.get_file(file_id)
+    src = tg_file.file_path
+    if src and os.path.isabs(src) and os.path.exists(src):
+        try:
+            os.link(src, dst)  # без копирования гигабайтов, если диск тот же
+            return dst
+        except OSError:
+            pass
+    await save_telegram_file(tg_file, dst)
+    return dst
+
+
+def recent_videos(chat_id: int) -> list[str]:
+    _cleanup_media(chat_id)
+    return [v["path"] for v in _video_bin.get(chat_id, [])]
+
+
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Видео → расшифровка речи + кадры → продюсерский разбор от Claude."""
+    """Видео копим пачкой: несколько роликов подряд = один заказ (монтаж или разбор)."""
     msg = update.message
     video = msg.video or msg.document
     if video is None:
         return
-
     file_size = getattr(video, "file_size", None)
     if file_size and file_size > TELEGRAM_BOT_FILE_LIMIT:
         await msg.reply_text(f"Файл весит {file_size / 1048576:.0f} МБ — это больше лимита 2 ГБ. Пришли покороче.")
         return
+    chat_id = update.effective_chat.id
+    name = getattr(video, "file_name", None) or f"video_{msg.message_id}.mp4"
+    _video_inflight[chat_id] += 1
+    try:
+        path = await _store_media(context, video.file_id, chat_id, name)
+    except Exception:
+        logger.exception("Video download error")
+        await msg.reply_text("Не получилось скачать видео. Попробуй отправить ещё раз.")
+        return
+    finally:
+        _video_inflight[chat_id] = max(0, _video_inflight[chat_id] - 1)
+    _cleanup_media(chat_id)
+    _video_bin[chat_id].append({"path": path, "name": name, "ts": _now()})
 
-    status = await msg.reply_text("🎬 Смотрю и слушаю ролик... Это займёт до минуты ⏳")
-    await update.effective_chat.send_action("typing")
     caption = (msg.caption or "").strip()
+    b = _video_batch.setdefault(chat_id, {"paths": [], "caption": "", "update": update, "task": None})
+    b["paths"].append(path)
+    if caption and not b["caption"]:
+        b["caption"], b["update"] = caption, update
+    if b["task"]:
+        b["task"].cancel()
+    b["task"] = asyncio.create_task(_flush_videos(chat_id))
 
-    with tempfile.TemporaryDirectory() as tmp:
-        src = os.path.join(tmp, "video.mp4")
-        try:
-            tg_file = await context.bot.get_file(video.file_id)
-            await save_telegram_file(tg_file, src)
-            duration = await social.video_duration(src)
-        except Exception:
-            logger.exception("Video download error")
-            await status.edit_text("Не получилось скачать видео. Попробуй отправить ещё раз.")
-            return
 
-        if duration > VIDEO_MAX_SECONDS:
-            await status.edit_text(
-                f"Видео длится {int(duration // 60)} мин — слишком долго для разбора. Пришли фрагмент до 15 минут."
+async def _flush_videos(chat_id: int) -> None:
+    try:
+        await asyncio.sleep(VIDEO_BATCH_WAIT)
+        for _ in range(120):  # ждём, пока докачаются остальные ролики пачки (до ~4 минут)
+            if _video_inflight.get(chat_id, 0) <= 0:
+                break
+            await asyncio.sleep(2)
+    except asyncio.CancelledError:
+        return
+    b = _video_batch.pop(chat_id, None)
+    if not b:
+        return
+    update, caption, paths = b["update"], b["caption"], b["paths"]
+    try:
+        if caption and MONTAGE_RE.search(caption) and MONTAGE_ENABLED:
+            await run_montage(update, caption, paths)
+        elif caption:
+            await review_videos(update, paths, caption)
+        else:
+            _pending_videos[chat_id] = paths
+            n = len(paths)
+            what = "видео" if n == 1 else f"{n} видео"
+            buttons = [[InlineKeyboardButton("🔍 Разобрать как продюсер", callback_data="vid:r")]]
+            if MONTAGE_ENABLED:
+                buttons.insert(0, [InlineKeyboardButton("🎬 Смонтировать рилс", callback_data="vid:m")])
+            await update.effective_message.reply_text(
+                f"Получила {what} 🎬 Что сделать?\n\n"
+                "Можно и словами: «смонтируй рилс до 40 секунд», «начни с фразы про деньги», «разбери хук».",
+                reply_markup=InlineKeyboardMarkup(buttons),
             )
-            return
+    except Exception:
+        logger.exception("Video batch error")
+        await update.effective_message.reply_text("Что-то пошло не так с видео. Попробуй ещё раз.")
 
-        frames = await social.extract_frames(src)
+
+async def on_video_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    try:
+        await q.answer()
+    except BadRequest:
+        pass
+    chat_id = update.effective_chat.id
+    paths = [p for p in (_pending_videos.pop(chat_id, None) or recent_videos(chat_id)) if os.path.exists(p)]
+    try:
+        await q.edit_message_reply_markup(reply_markup=None)
+    except BadRequest:
+        pass
+    if not paths:
+        await update.effective_message.reply_text("Видео уже удалились из памяти (храню 3 часа). Пришли их ещё раз 🙏")
+        return
+    if q.data == "vid:m":
+        await run_montage(update, "Смонтируй рилс", paths)
+    else:
+        await review_videos(update, paths, "")
+
+
+async def review_videos(update: Update, paths: list[str], caption: str) -> None:
+    """Продюсерский разбор одного или нескольких роликов (речь + кадры) — одним ответом."""
+    status = await update.effective_message.reply_text("🎬 Смотрю и слушаю ролик… Это займёт до минуты ⏳")
+    await update.effective_chat.send_action("typing")
+    paths = paths[:6]
+    per_clip = max(2, social.MAX_FRAMES // len(paths)) if len(paths) > 1 else social.MAX_FRAMES
+    summary_lines, images = [], []
+    for i, path in enumerate(paths, 1):
+        duration = await social.video_duration(path)
+        if duration > VIDEO_MAX_SECONDS:
+            summary_lines.append(f"[Видео {i}: {duration / 60:.0f} мин — слишком длинное, пропускаю]")
+            continue
+        frames = await social.extract_frames(path, count=per_clip)
         transcript = ""
         if openai_client is not None:
             try:
-                audio = await extract_audio_mp3_from_path(src)
+                audio = await extract_audio_mp3_from_path(path)
                 if audio:
                     transcript = await transcribe(audio, "audio.mp3")
             except Exception:
                 logger.exception("Video transcription error")
-
-    if not frames and not transcript:
+        label = f"Видео {i} · {duration:.0f} сек" if len(paths) > 1 else f"Видео от Анны · {duration:.0f} сек"
+        summary_lines.append(f"[{label}]\nРасшифровка речи:\n{transcript[:5000]}" if transcript
+                             else f"[{label}] Речи нет (или не распознана) — смысл в картинке и тексте на экране.")
+        for fr in frames:
+            images.append((label, fr))
+    if not images and not any("Расшифровка" in s for s in summary_lines):
         await status.edit_text("Не получилось разобрать видео — возможно, файл повреждён. Попробуй другой.")
         return
-
     try:
-        await status.edit_text("✅ Посмотрела ролик. Разбираю как продюсер...")
+        await status.edit_text("✅ Посмотрела. Разбираю как продюсер...")
     except BadRequest:
         pass
-
-    summary_lines = [f"[Видео от Анны · {duration:.0f} сек]"]
-    summary_lines.append(
-        f"Расшифровка речи:\n{transcript[:6000]}" if transcript
-        else "Речи в видео нет (или не распознана) — смысл передаётся картинкой и текстом на экране."
-    )
-    if frames:
-        summary_lines.append(f"Ниже — {len(frames)} кадров из видео по порядку (первый — начало ролика, хук).")
-    summary = "\n".join(summary_lines)
-
+    summary = "\n\n".join(summary_lines)
     content: list[dict] = [{"type": "text", "text": summary}]
-    content += [social.image_block(fr) for fr in frames]
+    last_label = None
+    for label, fr in images:
+        if label != last_label:
+            content.append({"type": "text", "text": f"Кадры: {label} (по порядку, первый — хук)"})
+            last_label = label
+        content.append(social.image_block(fr))
     content.append({"type": "text", "text": caption or VIDEO_REVIEW_PROMPT})
-
     note = summary[:6000] + (f"\n\n{caption}" if caption else "\n\n[Разбери моё видео]")
     await ask_claude(update, update.effective_chat.id, content, history_note=note)
+
+
+def _remember_in_history(chat_id: int, user_note: str, bot_note: str) -> None:
+    history = conversations.get(chat_id, []) + [
+        {"role": "user", "content": user_note},
+        {"role": "assistant", "content": bot_note},
+    ]
+    conversations[chat_id] = _sanitize_history(history[-MAX_HISTORY_MESSAGES:])
+    _save_conversations()
+
+
+async def _prepare_clip(path: str, idx: int) -> montage.Clip:
+    cached = _transcript_cache.get(path)
+    name = re.sub(r"^\d+_", "", os.path.basename(path))
+    if cached:
+        info, words, segs = cached["probe"], cached["words"], cached["segments"]
+    else:
+        info = await montage.probe(path)
+        words, segs = [], []
+        if info["has_audio"] and openai_client is not None:
+            mp3 = path + ".words.mp3"
+            try:
+                if await montage.extract_audio(path, mp3) and os.path.getsize(mp3) <= WHISPER_MAX_BYTES:
+                    words, segs = await montage.transcribe_words(openai_client, mp3)
+            except Exception:
+                logger.exception("Word-level transcription error")
+            finally:
+                try:
+                    os.remove(mp3)
+                except OSError:
+                    pass
+        _transcript_cache[path] = {"probe": info, "words": words, "segments": segs}
+    return montage.Clip(path, name or f"клип {idx}", info["duration"], info["width"], info["height"],
+                        info["has_audio"], list(words), list(segs))
+
+
+async def save_music(update: Update, context, media, name: str) -> None:
+    """Трек для фоновой музыки монтажа. Если недавно был монтаж — сразу пересобираю его с музыкой."""
+    chat_id = update.effective_chat.id
+    try:
+        path = await _store_media(context, media.file_id, chat_id, name)
+    except Exception:
+        logger.exception("Music download error")
+        await update.effective_message.reply_text("Не получилось скачать трек. Попробуй ещё раз.")
+        return
+    old = _music_bin.get(chat_id)
+    if old and old["path"] != path:
+        try:
+            os.remove(old["path"])
+        except OSError:
+            pass
+    _music_bin[chat_id] = {"path": path, "ts": _now(), "name": name}
+    last = _last_montage.get(chat_id)
+    if last and _now() - last["ts"] < 2 * 3600 and all(os.path.exists(p) for p in last["videos"]):
+        await update.effective_message.reply_text("🎵 Трек получила — пересобираю последний рилс с музыкой.")
+        await run_montage(update, last.get("request", ""), last["videos"], previous=last["plan"], reuse_plan=True)
+    else:
+        await update.effective_message.reply_text(
+            "🎵 Сохранила трек — добавлю его фоном в следующий монтаж (тихо, под голос). "
+            "Чтобы смонтировать без музыки, напиши «без музыки».")
+
+
+async def run_montage(update: Update, request: str, paths: list[str], previous: dict | None = None,
+                      reuse_plan: bool = False) -> None:
+    chat_id = update.effective_chat.id
+    paths = [p for p in paths if os.path.exists(p)][:12]
+    if not paths:
+        await update.effective_message.reply_text("Не вижу видео для монтажа. Пришли ролики (можно несколько) 🎬")
+        return
+    n = len(paths)
+    status = await update.effective_message.reply_text(
+        f"🎬 Монтирую рилс из {n} видео. Это займёт несколько минут — можно пока заниматься делами ⏳\n\n1/4 · Слушаю речь…"
+    )
+
+    async def st(text: str):
+        try:
+            await status.edit_text(text)
+        except BadRequest:
+            pass
+
+    if montage_semaphore.locked():
+        await st("⏳ Сейчас доделываю другой монтаж — твой следующий в очереди…")
+    async with montage_semaphore:
+        workdir = tempfile.mkdtemp(dir=MEDIA_DIR if os.path.isdir(MEDIA_DIR) else None)
+        typing_task = asyncio.create_task(_keep_typing(update))
+        try:
+            clips = []
+            for i, p in enumerate(paths, 1):
+                c = await _prepare_clip(p, i)
+                if c.duration > VIDEO_MAX_SECONDS:
+                    continue
+                clips.append(c)
+            if not clips:
+                await st("Видео слишком длинные (больше 15 минут) или не читаются. Пришли покороче 🙏")
+                return
+
+            low = (request or "").lower()
+            subtitles = "без субтитр" not in low
+            cut_pauses = "не вырезай" not in low
+            if reuse_plan and previous:
+                plan = previous
+            else:
+                await st(f"🎬 Монтирую рилс из {len(clips)} видео ⏳\n\n2/4 · Выбираю лучшие куски и дубли…")
+                plan = None
+                if any(c.segments for c in clips):
+                    try:
+                        resp = await client.messages.create(
+                            model=CLAUDE_MODEL, max_tokens=3000, system=montage.PLANNER_SYSTEM,
+                            messages=[{"role": "user", "content": montage.planner_input(clips, request, previous)}],
+                        )
+                        _log_usage("монтаж", resp)
+                        text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+                        plan = montage.parse_plan(text, clips)
+                    except Exception:
+                        logger.exception("Montage planner error")
+                if plan is None:
+                    plan = montage.fallback_plan(clips)
+            pieces = montage.build_pieces(plan, clips, cut_pauses=cut_pauses)
+
+            music = None
+            m = _music_bin.get(chat_id)
+            if m and os.path.exists(m["path"]) and "без музык" not in low:
+                music = m["path"]
+
+            await st(f"🎬 Монтирую рилс ⏳\n\n3/4 · Режу и склеиваю: {len(pieces)} кусков…")
+
+            async def progress(done: int, total: int):
+                await st(f"🎬 Монтирую рилс ⏳\n\n3/4 · Режу и склеиваю: {done}/{total}…")
+
+            out, total = await montage.render(clips, pieces, workdir, hook=plan.get("hook", ""),
+                                              subtitles=subtitles, music_path=music, progress=progress)
+            await st("🎬 Почти готово ⏳\n\n4/4 · Отправляю…")
+            lines = [f"🎬 Готово · {total:.0f} сек"]
+            if plan.get("hook"):
+                lines.append(f"Хук: «{plan['hook']}»")
+            if plan.get("notes"):
+                lines.append(plan["notes"][:300])
+            lines.append(
+                "\nЧто поправить? Напиши: «короче», «другой хук», «без субтитров», «начни с фразы про…»"
+                + ("" if music else " — или пришли трек, добавлю музыку 🎵")
+            )
+            with open(out, "rb") as f:
+                await update.effective_chat.send_video(
+                    video=f, caption="\n".join(lines)[:1000], width=montage.OUT_W, height=montage.OUT_H,
+                    duration=int(total), supports_streaming=True, read_timeout=600, write_timeout=600,
+                )
+            try:
+                await status.delete()
+            except BadRequest:
+                pass
+            if plan.get("caption"):
+                await send_long(update, "✍️ **Подпись к посту:**\n\n" + plan["caption"])
+            _last_montage[chat_id] = {"videos": paths, "plan": plan, "ts": _now(), "request": request}
+            _remember_in_history(
+                chat_id, f"[Анна прислала {len(clips)} видео и попросила смонтировать рилс] {request}",
+                f"[Смонтировала рилс {total:.0f} сек. Хук: «{plan.get('hook', '')}». {plan.get('notes', '')}]\n"
+                f"Подпись: {plan.get('caption', '')[:1500]}",
+            )
+        except montage.MontageError as e:
+            await st(f"Не получилось смонтировать: {e}. Попробуй ещё раз или пришли видео покороче.")
+        except Exception:
+            logger.exception("Montage error")
+            await st("Не получилось смонтировать видео 😕 Попробуй ещё раз через пару минут.")
+        finally:
+            typing_task.cancel()
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
+def montage_followup(chat_id: int, text: str) -> str | None:
+    """Распознаёт просьбу смонтировать/поправить монтаж. 'new' | 'edit' | None."""
+    if not MONTAGE_ENABLED:
+        return None
+    last = _last_montage.get(chat_id)
+    fresh = last and _now() - last["ts"] < 2 * 3600
+    if MONTAGE_RE.search(text) and recent_videos(chat_id):
+        return "edit" if fresh and MONTAGE_EDIT_RE.search(text) else "new"
+    if fresh and _now() - last["ts"] < 30 * 60 and MONTAGE_EDIT_RE.search(text) and len(text) < 300:
+        return "edit"
+    return None
 
 
 async def extract_audio_mp3_from_path(path: str) -> bytes | None:
@@ -1857,6 +2274,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def handle_audio_document(update: Update, context: ContextTypes.DEFAULT_TYPE, doc) -> None:
     """Аудио, присланное файлом (например, запись из диктофона)."""
+    if MUSIC_CAPTION_RE.search(update.message.caption or ""):
+        await save_music(update, context, doc, doc.file_name or "music.mp3")
+        return
     if openai_client is None:
         await update.message.reply_text("Распознавание голоса не настроено (нет ключа OpenAI).")
         return
@@ -1914,6 +2334,7 @@ def main() -> None:
     app.add_handler(CommandHandler(["carousel", "karusel"], guarded(carousel_command)))
     app.add_handler(CommandHandler(["designs", "design"], guarded(designs_command)))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, guarded(handle_video)))
+    app.add_handler(CallbackQueryHandler(guarded(on_video_button), pattern=r"^vid:"))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE, guarded(handle_voice)))
     app.add_handler(MessageHandler(filters.PHOTO, guarded(handle_photo)))
     app.add_handler(MessageHandler(filters.Document.ALL & ~filters.Document.VIDEO, guarded(handle_document)))
