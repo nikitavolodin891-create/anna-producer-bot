@@ -13,7 +13,7 @@ FROM python:3.13-alpine
 # Рантайм-зависимости бинарника telegram-bot-api (собран на Alpine/musl) + bash
 # (нужен start.sh для `wait -n`, которого нет в стандартном ash/busybox) + ffmpeg
 # (нужен боту, чтобы доставать звук и кадры из видео и рилсов для разбора).
-RUN apk add --no-cache openssl libstdc++ ca-certificates bash ffmpeg
+RUN apk add --no-cache openssl libstdc++ ca-certificates bash ffmpeg fontconfig font-dejavu
 
 COPY --from=botapi /usr/local/bin/telegram-bot-api /usr/local/bin/telegram-bot-api
 
@@ -28,6 +28,8 @@ RUN pip install --no-cache-dir -r requirements.txt \
 
 COPY *.py ./
 COPY *.ttf ./fonts/
+# шрифты в системный каталог — их видит libass (субтитры и хук в монтаже)
+RUN mkdir -p /usr/share/fonts/anna && cp ./fonts/*.ttf /usr/share/fonts/anna/ && fc-cache -f
 COPY start.sh .
 RUN chmod +x start.sh
 
