@@ -133,6 +133,18 @@ async def transcribe_words(openai_client, mp3_path: str) -> tuple[list[Word], li
     segs = [{"start": float(g(s, "start")), "end": float(g(s, "end")), "text": str(g(s, "text")).strip()}
             for s in (g(resp, "segments") or [])]
     words = [w for w in words if w.text and w.end > w.start - 0.01]
+    if not words and segs:
+        # Whisper не дал таймкоды слов — раскладываем слова фразы равномерно по её длительности
+        for sg in segs:
+            toks = sg["text"].split()
+            if not toks:
+                continue
+            step = max(0.05, (sg["end"] - sg["start"]) / len(toks))
+            for k, tok in enumerate(toks):
+                a = sg["start"] + k * step
+                words.append(Word(a, a + step * 0.9, tok))
+        logger.warning("Whisper вернул фразы без слов — таймкоды слов посчитаны приблизительно")
+    logger.info("Распознано: фраз %d, слов %d", len(segs), len(words))
     return words, segs
 
 
@@ -259,6 +271,7 @@ def build_pieces(plan: dict, clips: list[Clip], cut_pauses: bool = True) -> list
         total += m.dur
     if not capped:
         raise MontageError("после подрезки ничего не осталось")
+    logger.info("Монтаж: %d кусков, %.1f сек, слов в кусках %d", len(capped), total, sum(len(m.words) for m in capped))
     return capped
 
 
@@ -404,6 +417,9 @@ async def render(clips: list[Clip], pieces: list[Piece], workdir: str, hook: str
              "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-t", f"{total:.3f}",
              "-movflags", "+faststart", out_path]
     code, out = await _run(*args)
+    font_lines = [ln for ln in out.splitlines() if re.search(r"(fontselect|libass|\[Parsed_ass|fontconfig|Glyph)", ln, re.I)]
+    if font_lines:
+        logger.info("libass: %s", " | ".join(font_lines[-8:])[:1500])
     if code != 0 or not os.path.exists(out_path):
         logger.error("final render failed: %s", out[-2000:])
         raise MontageError("не получилось собрать итоговое видео")
