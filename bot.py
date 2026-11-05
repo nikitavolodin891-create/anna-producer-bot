@@ -229,9 +229,9 @@ async def send_long(update: Update, text: str) -> None:
 # Кэширование промпта: большая неизменная инструкция (prompt.py, ~15–20 тыс. токенов) и история
 # переписки кэшируются на стороне Anthropic. Повторное чтение из кэша стоит 10% от обычной цены,
 # запись в кэш — 125% (TTL 5 минут, продлевается при каждом попадании) или 200% (TTL 1 час).
-# Выключить: PROMPT_CACHE=0. Час вместо 5 минут: PROMPT_CACHE_TTL=1h.
+# Выключить: PROMPT_CACHE=0. По умолчанию кэш на 1 час (максимум у Anthropic); 5 минут: PROMPT_CACHE_TTL=5m.
 PROMPT_CACHE = os.environ.get("PROMPT_CACHE", "1") != "0"
-PROMPT_CACHE_TTL = os.environ.get("PROMPT_CACHE_TTL", "5m")
+PROMPT_CACHE_TTL = os.environ.get("PROMPT_CACHE_TTL", "1h")
 
 
 def _cache_control() -> dict:
@@ -865,12 +865,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 SCRIPT_INTENT_RE = re.compile(r"(сценари|рилс|reels|хук|ролик|подпис\w*\s+к\s+пост|что\s+снять|идеи\s+для\s+(видео|контента))", re.I)
 
 
+# Основная модель — только когда просят СОЗДАТЬ или ПЕРЕДЕЛАТЬ контент. Вопросы «что такое прогрев?»,
+# «как часто постить?», болтовня и короткие ответы идут в дешёвую модель.
 CONTENT_ASK_RE = re.compile(
-    r"(напиш|придума|сочин|пост|текст|подпис|сторис|stories|рилс|reels|карусел|контент|хук|сценари|"
-    r"идеи|идею|план|стратег|воронк|прогрев|запуск|продаж|оффер|разбер|разбор|проанализ|анализ|аудит|"
-    r"перепиш|переделай|исправ|улучш|сократ|короче|длиннее|ещё вариант|еще вариант|другой вариант|вариант)",
+    r"(напиш|придума|сочин|состав|сгенер|перепиш|переделай|передела|исправ|улучш|сократ|дополн|"
+    r"короче|длиннее|ещё вариант|еще вариант|другой вариант|разбер|проанализ|аудит|сценари)",
     re.I,
 )
+CONTENT_NOUN_RE = re.compile(
+    r"(пост|текст|подпис|сторис|stories|рилс|reels|карусел|контент|хук|иде[июяей]|план|стратег|воронк|прогрев|оффер)",
+    re.I,
+)
+CONTENT_REQ_RE = re.compile(r"(дай|давай|предлож|нужн|нужен|хочу|сделай|можешь|помоги|подкин|покажи|накидай)", re.I)
 
 
 def is_simple_question(chat_id: int, user_text: str) -> bool:
@@ -879,8 +885,10 @@ def is_simple_question(chat_id: int, user_text: str) -> bool:
     if not FAST_MODEL or FAST_MODEL.lower() in ("off", "0", "none") or FAST_MODEL == CLAUDE_MODEL:
         return False
     text = user_text.strip()
-    if len(text) > 300 or CONTENT_ASK_RE.search(text):
+    if len(text) > 400 or CONTENT_ASK_RE.search(text):
         return False
+    if CONTENT_NOUN_RE.search(text) and CONTENT_REQ_RE.search(text):
+        return False  # «дай идею для поста», «нужен план прогрева» — это работа с контентом
     history = conversations.get(chat_id, [])
     last_bot = next((m for m in reversed(history) if m.get("role") == "assistant"), None)
     if last_bot:
