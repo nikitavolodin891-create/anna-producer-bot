@@ -69,7 +69,7 @@ def brief_text(stats: dict, prev: dict | None, now_local: datetime) -> str:
             pass
         lines.append(f"Подписчики: {_n(stats.get('followers'))}{_delta(stats.get('followers'), prev.get('followers'))}")
     else:
-        lines.append(f"Подписчики: {_n(stats.get('followers'))}. Это первая сводка — сравнивать пока не с чем.")
+        lines.append(f"Подписчики: {_n(stats.get('followers'))} — это первая сводка, сравнивать пока не с чем.")
     if stats.get("median_plays"):
         lines.append(f"Медиана просмотров рилсов (последние {stats.get('reels_count')}): {_n(stats['median_plays'])}")
     if stats.get("per_week"):
@@ -77,10 +77,24 @@ def brief_text(stats: dict, prev: dict | None, now_local: datetime) -> str:
 
     rows = [r for r in stats["rows"] if not r.get("pinned")]
     rows.sort(key=lambda r: r["dt"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    # дубли: одинаковое начало подписи у разных публикаций
+    seen: dict[str, str] = {}
+    dup_codes = set()
+    for r in sorted(rows, key=lambda r: r["dt"] or datetime.min.replace(tzinfo=timezone.utc)):
+        key = " ".join((r["caption"] or "").lower().split())[:80]
+        if len(key) >= 25:
+            if key in seen:
+                dup_codes.add(r["code"])
+            else:
+                seen[key] = r["code"]
+    if dup_codes:
+        lines.append(f"[!] Найдено повторов (одна и та же подпись выложена ещё раз): {len(dup_codes)}")
     lines.append("\nПоследние публикации (новые сверху):")
     for r in rows[:8]:
         o = old_posts.get(r["code"])
         tag = " 🆕 НОВАЯ с прошлой проверки" if prev and not o else ""
+        if r["code"] in dup_codes:
+            tag += " [!] ДУБЛЬ (такая же подпись уже была)"
         when = r["dt"].strftime("%d.%m %H:%M") if r["dt"] else "?"
         cap = (r["caption"] or "").replace("\n", " ")[:90]
         plays = f"просмотры {_n(r['plays'])}{_delta(r['plays'], (o or {}).get('plays')) if o else ''}, " if r["plays"] else ""
