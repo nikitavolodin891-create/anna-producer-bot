@@ -1665,10 +1665,17 @@ def _mark_mode(chat_id: int, mode: str) -> None:
     _last_mode[chat_id] = (mode, asyncio.get_event_loop().time())
 
 
-def _recent_mode(chat_id: int, within: float = 1800) -> str | None:
+def _recent_mode(chat_id: int, within: float = 12 * 3600) -> str | None:
     m = _last_mode.get(chat_id)
     if m and asyncio.get_event_loop().time() - m[1] < within:
         return m[0]
+    # после перезапуска бота — смотрим, чем закончился последний ответ
+    history = conversations.get(chat_id) or []
+    if history and history[-1].get("role") == "assistant":
+        c = history[-1].get("content")
+        text = c if isinstance(c, str) else " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+        if re.search(r"(давай исправ|залетели у конкурентов)", text[-600:], re.I):
+            return "brief"
     return None
 
 
