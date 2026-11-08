@@ -46,6 +46,94 @@ def save_snapshot(data_dir: str, snap: dict) -> None:
     os.replace(tmp, _path(data_dir))
 
 
+def _lang(text: str) -> str | None:
+    t = (text or "").lower()
+    ua = sum(t.count(c) for c in "іїєґ")
+    ru = sum(t.count(c) for c in "ыэъё")
+    if ua > ru and ua >= 2:
+        return "укр"
+    if ru > ua and ru >= 2:
+        return "рус"
+    return None
+
+
+def _hist_path(data_dir: str) -> str:
+    return os.path.join(data_dir, "brief_history.json")
+
+
+def load_history(data_dir: str) -> list[dict]:
+    try:
+        with open(_hist_path(data_dir), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def add_history(data_dir: str, stats: dict) -> None:
+    """Одна точка в день: подписчики + медиана просмотров — для недельного отчёта."""
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    hist = [h for h in load_history(data_dir) if h.get("date") != day]
+    reels = [r for r in stats["rows"] if r["kind"] == "рилс" and r.get("plays") and r.get("dt")]
+    hist.append({
+        "date": day,
+        "followers": stats.get("followers"),
+        "median_plays": stats.get("median_plays"),
+        "reels": [{"code": r["code"], "plays": r["plays"], "dt": r["dt"].isoformat(),
+                   "cap": (r["caption"] or "")[:80]} for r in reels],
+    })
+    hist = hist[-120:]
+    os.makedirs(data_dir, exist_ok=True)
+    tmp = _hist_path(data_dir) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(hist, f, ensure_ascii=False)
+    os.replace(tmp, _hist_path(data_dir))
+
+
+def weekly_text(data_dir: str) -> str | None:
+    """Недельный отчёт кодом (без модели): подписчики и просмотры этой недели против прошлой."""
+    import statistics
+    hist = load_history(data_dir)
+    if len(hist) < 2:
+        return None
+    now = datetime.now(timezone.utc)
+    reels: dict[str, dict] = {}
+    for h in hist:
+        for r in h.get("reels", []):
+            reels[r["code"]] = r  # последняя известная цифра
+    def week(lo, hi):
+        out = []
+        for r in reels.values():
+            try:
+                age = (now - datetime.fromisoformat(r["dt"])).days
+            except ValueError:
+                continue
+            if lo <= age < hi:
+                out.append(r)
+        return out
+    cur, prev = week(0, 7), week(7, 14)
+    med = lambda xs: statistics.median([x["plays"] for x in xs]) if xs else None
+    f_now = hist[-1].get("followers")
+    f_old = next((h.get("followers") for h in hist if (now - datetime.fromisoformat(h["date"] + "T00:00:00+00:00")).days <= 8), None)
+    lines = ["📊 Итоги недели"]
+    if f_now is not None and f_old is not None:
+        d = f_now - f_old
+        lines.append(f"Подписчики: {_n(f_now)} ({'+' if d >= 0 else ''}{_n(d)} за неделю)")
+    mc, mp = med(cur), med(prev)
+    if mc is not None:
+        trend = ""
+        if mp:
+            pct = (mc - mp) / mp * 100
+            trend = f" — было {_n(mp)} ({'+' if pct >= 0 else ''}{pct:.0f}%)"
+        lines.append(f"Рилсов за неделю: {len(cur)}, средние просмотры: {_n(mc)}{trend}")
+    if cur:
+        best = max(cur, key=lambda r: r["plays"])
+        lines.append(f"Лучший рилс недели: {_n(best['plays'])} просмотров — «{best['cap'][:60]}»\nhttps://www.instagram.com/reel/{best['code']}/")
+    if len(cur) > 10:
+        lines.append(f"[!] {len(cur)} рилсов за неделю — слишком много: ролики отбирают охват друг у друга. Норма — 1 в день.")
+    lines.append("\nЧтобы сделать следующую неделю сильнее — напиши «давай исправим».")
+    return "\n".join(lines)
+
+
 def _n(x) -> str:
     return social._fmt_num(x) if x is not None else "—"
 
@@ -87,6 +175,18 @@ def brief_text(stats: dict, prev: dict | None, now_local: datetime) -> str:
                 dup_codes.add(r["code"])
             else:
                 seen[key] = r["code"]
+    day_ago = [r for r in rows if r["dt"] and (now_local - r["dt"]).total_seconds() < 86400]
+    if len(day_ago) > 2:
+        lines.append(f"[!] СЛИШКОМ ЧАСТО: {len(day_ago)} публикаций за последние сутки (норма — 1, максимум 2).")
+    langs: dict[str, list] = {}
+    for r in rows:
+        lg = _lang(r["caption"])
+        if lg and r.get("plays"):
+            langs.setdefault(lg, []).append(r["plays"])
+    if len(langs) == 2:
+        import statistics
+        parts = [f"{k} — медиана {_n(statistics.median(v))} ({len(v)} шт.)" for k, v in langs.items()]
+        lines.append("Язык подписи и просмотры: " + "; ".join(parts))
     if dup_codes:
         lines.append(f"[!] Найдено повторов (одна и та же подпись выложена ещё раз): {len(dup_codes)}")
     lines.append("\nПоследние публикации (новые сверху):")
@@ -95,6 +195,11 @@ def brief_text(stats: dict, prev: dict | None, now_local: datetime) -> str:
         tag = " 🆕 НОВАЯ с прошлой проверки" if prev and not o else ""
         if r["code"] in dup_codes:
             tag += " [!] ДУБЛЬ (такая же подпись уже была)"
+        if r.get("duration") and r["duration"] > 75:
+            tag += f" [!] ДЛИННЫЙ ({r['duration']:.0f} с)"
+        lg = _lang(r["caption"])
+        if lg:
+            tag += f" · язык: {lg}"
         when = r["dt"].strftime("%d.%m %H:%M") if r["dt"] else "?"
         cap = (r["caption"] or "").replace("\n", " ")[:90]
         plays = f"просмотры {_n(r['plays'])}{_delta(r['plays'], (o or {}).get('plays')) if o else ''}, " if r["plays"] else ""
