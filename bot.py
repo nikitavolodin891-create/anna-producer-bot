@@ -256,9 +256,9 @@ PROMPT_CACHE = os.environ.get("PROMPT_CACHE", "1") != "0"
 PROMPT_CACHE_TTL = os.environ.get("PROMPT_CACHE_TTL", "1h")
 
 
-def _cache_control() -> dict:
+def _cache_control(ttl: str | None = None) -> dict:
     cc = {"type": "ephemeral"}
-    if PROMPT_CACHE_TTL == "1h":
+    if (ttl or PROMPT_CACHE_TTL) == "1h":
         cc["ttl"] = "1h"
     return cc
 
@@ -277,6 +277,10 @@ def _cache_last_message(messages: list[dict]) -> list[dict]:
         return messages
     msgs = list(messages)
     content = msgs[-1]["content"]
+    # Большие разовые запросы (сценарии, сводки, видео, картинки) в историю сохраняются коротко —
+    # следующий запрос их кэш не прочитает, а запись в кэш дороже обычного входа. Их не кэшируем.
+    if isinstance(content, list) or len(str(content)) > 4000:
+        return messages
     if isinstance(content, str):
         if not content.strip():
             return messages
@@ -287,7 +291,7 @@ def _cache_last_message(messages: list[dict]) -> list[dict]:
             return messages
     else:
         return messages
-    blocks[-1] = {**blocks[-1], "cache_control": _cache_control()}
+    blocks[-1] = {**blocks[-1], "cache_control": _cache_control("5m")}  # переписка: 5 минут (запись 125%, а не 200%)
     msgs[-1] = {**msgs[-1], "content": blocks}
     return msgs
 
