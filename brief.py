@@ -134,6 +134,33 @@ def weekly_text(data_dir: str) -> str | None:
     return "\n".join(lines)
 
 
+def own_hits_text(data_dir: str, days: int = 30) -> str:
+    """Собственные ролики Анны за месяц: что её аудитория уже «проголосовала» просмотрами."""
+    import statistics
+    now = datetime.now(timezone.utc)
+    reels: dict[str, dict] = {}
+    for h in load_history(data_dir):
+        for r in h.get("reels", []):
+            reels[r["code"]] = r
+    fresh = []
+    for r in reels.values():
+        try:
+            if (now - datetime.fromisoformat(r["dt"])).days <= days:
+                fresh.append(r)
+        except ValueError:
+            pass
+    if len(fresh) < 4:
+        return ""
+    med = statistics.median([r["plays"] for r in fresh])
+    fresh.sort(key=lambda r: r["plays"], reverse=True)
+    fmt = lambda r: f"- {_n(r['plays'])} просмотров (×{r['plays'] / med:.1f} от её медианы) — «{r['cap']}» https://www.instagram.com/reel/{r['code']}/"
+    lines = [f"[Собственные ролики Анны за {days} дней: {len(fresh)} шт., медиана {_n(med)}]", "Её хиты (аудитория уже проголосовала):"]
+    lines += [fmt(r) for r in fresh[:3] if r["plays"] >= med * 1.5]
+    lines.append("Её провалы (так не делать):")
+    lines += [fmt(r) for r in fresh[-3:]]
+    return "\n".join(lines)
+
+
 def _n(x) -> str:
     return social._fmt_num(x) if x is not None else "—"
 
