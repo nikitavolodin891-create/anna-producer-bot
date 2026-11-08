@@ -1680,6 +1680,52 @@ def _recent_mode(chat_id: int, within: float = 12 * 3600) -> str | None:
     return None
 
 
+_hook_cache: dict[str, str] = {}
+
+
+async def _hook_transcripts(rows: list[dict], limit: int = 4, seconds: int = 6) -> str:
+    """Расшифровка первых секунд залетевших роликов: хук чаще всего — первая сказанная фраза."""
+    if openai_client is None:
+        return ""
+    out = []
+    for i, r in enumerate(rows[:8], 1):
+        if len(out) >= limit:
+            break
+        url = r.get("video")
+        if not url:
+            continue
+        if r["url"] in _hook_cache:
+            text = _hook_cache[r["url"]]
+        else:
+            text = ""
+            src = os.path.join(MEDIA_DIR, f"hook_{i}.mp4")
+            dst = os.path.join(MEDIA_DIR, f"hook_{i}.mp3")
+            try:
+                os.makedirs(MEDIA_DIR, exist_ok=True)
+                data = await social.download_bytes(url, max_bytes=40 * 1024 * 1024)
+                with open(src, "wb") as f:
+                    f.write(data)
+                code, _ = await social._run("ffmpeg", "-y", "-i", src, "-t", str(seconds), "-vn", "-ac", "1",
+                                            "-ar", "16000", "-b:a", "48k", dst, timeout=60)
+                if code == 0 and os.path.exists(dst):
+                    with open(dst, "rb") as f:
+                        text = (await transcribe(f.read(), "hook.mp3")).strip()
+            except Exception:
+                logger.warning("Не удалось расшифровать начало ролика %s", r.get("url"))
+            finally:
+                for pth in (src, dst):
+                    try:
+                        os.remove(pth)
+                    except OSError:
+                        pass
+            _hook_cache[r["url"]] = text
+        if text:
+            out.append(f"№{i} @{r['author']}: «{text[:300]}»")
+        else:
+            out.append(f"№{i} @{r['author']}: (без речи в первые секунды — хук визуальный или текстом на экране)")
+    return "\n".join(out)
+
+
 async def run_hits(update: Update, topic: str = "") -> None:
     chat_id = update.effective_chat.id
     status = await update.effective_message.reply_text(
@@ -1699,6 +1745,12 @@ async def run_hits(update: Update, topic: str = "") -> None:
     except BadRequest:
         pass
     summary = trends.trends_text(result)
+    hooks = await _hook_transcripts(result["rows"])
+    if hooks:
+        summary += "\n\n[Что говорят в первые секунды залетевших роликов — дословная расшифровка]\n" + hooks
+    own = brief.own_hits_text(DATA_DIR)
+    if own:
+        summary += "\n\n" + own
     content: list[dict] = [{"type": "text", "text": summary}]
     for label, data_bytes, mime in await trends.covers(result, limit=3):
         content.append({"type": "text", "text": f"Обложка {label}"})
