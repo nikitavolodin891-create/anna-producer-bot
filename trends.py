@@ -127,6 +127,7 @@ def _row(p: dict, source: str) -> dict:
         "posted": _ts(p),
         "caption": (p.get("caption") or "").strip(),
         "cover": p.get("displayUrl"),
+        "video": p.get("videoUrl"),
         "x_author": None,
     }
 
