@@ -603,6 +603,7 @@ HELP_TEXT = (
     "• Голосовые и кружки 🎙 · поиск в интернете 🔎 · любые вопросы\n"
     "• «Запомни: …» — запомню факт, /memory — что я помню\n"
     "• /morning — сводка сама каждое утро + итоги недели по понедельникам (/stop_morning — выключить), /week — итоги недели сейчас\n"
+    "• /plan — контент-план на неделю: 7 рилсов + сторис-прогрев к твоим курсам и мероприятиям\n"
     "• /new — начать диалог заново"
 )
 
@@ -1802,6 +1803,12 @@ BRIEF_PROMPT = """Сделай Анне утреннюю сводку по её 
 - Не рассуждай о том, что «видит», «любит» или «наказывает» алгоритм, — это догадки. Объясняй через людей:
   что зритель почувствовал, почему остановился или пролистал.
 - Если в данных есть пометка «[!] ДУБЛЬ» — прямо скажи, что ролик выложен повторно, и что частоту накручивают дубли.
+- Если с последней публикации прошло 2+ дня — мягко напомни и дай готовый короткий сценарий на 30 секунд
+  (хук дословно + 3–4 фразы), чтобы снять сегодня без подготовки.
+- Если в сообщении есть «Заметка бота: … не присылала готовое видео на проверку» — одной тёплой строкой напомни:
+  «Сняла что-то? Пришли мне перед публикацией — проверю хук и первые секунды».
+- Если Анна выбрала «каждый день по одной теме» — после «Что изменить» добавь блок **Тема дня**: тема, хук дословно,
+  текст на экране, формат до 60 секунд.
 - Если есть «[!] СЛИШКОМ ЧАСТО» — прямо скажи: ролики отбирают охват друг у друга, норма — 1 рилс в день.
 - Если у слабых роликов пометка «[!] ДЛИННЫЙ» — скажи, что длинные ролики почти не досматривают, держать до 60 секунд.
 - Если есть строка «Язык подписи и просмотры» и один язык заметно сильнее (в 1,5+ раза) — скажи, на каком языке
@@ -2019,6 +2026,7 @@ async def on_video_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def review_videos(update: Update, paths: list[str], caption: str) -> None:
     """Продюсерский разбор одного или нескольких роликов (речь + кадры) — одним ответом."""
+    _set_state(update.effective_chat.id, "last_video", datetime.datetime.now(datetime.timezone.utc).timestamp())
     status = await update.effective_message.reply_text("🎬 Смотрю и слушаю ролик — проверю перед публикацией. Это займёт до минуты ⏳")
     await update.effective_chat.send_action("typing")
     paths = paths[:6]
@@ -2457,6 +2465,124 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Необработанная ошибка", exc_info=context.error)
 
 
+def _state_path() -> str:
+    return os.path.join(DATA_DIR, "chat_state.json")
+
+
+def _all_state() -> dict:
+    try:
+        with open(_state_path(), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _get_state(chat_id: int) -> dict:
+    return _all_state().get(str(chat_id), {})
+
+
+def _set_state(chat_id: int, key: str, value) -> None:
+    d = _all_state()
+    d.setdefault(str(chat_id), {})[key] = value
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(_state_path(), "w", encoding="utf-8") as f:
+            json.dump(d, f)
+    except OSError:
+        logger.exception("chat state save error")
+
+
+PLAN_PROMPT = """Составь Анне контент-план на неделю (понедельник–воскресенье): 7 рилсов + сторис.
+Выше — залетевшие ролики ниши и конкурентов, расшифровка их первых секунд и её собственные хиты и провалы
+(если блоки есть). Её продукты, курсы, интенсивы, ретриты и мероприятия — в блоке памяти (если есть).
+
+Распределение: 3 дня — развитие её собственных хитов (тема/формат, новый угол), 3 дня — механики залетевших
+роликов конкурентов на её темы, 1 день — ответ на частый вопрос её аудитории.
+
+Для каждого дня одним компактным блоком:
+**День — тема**
+- Хук (первая фраза дословно, первые 2 секунды) + текст на экране до 6 слов;
+- Формат и длина (до 60 секунд), язык (укр/рус — по тому, какой язык у её хитов);
+- Сторис дня: 2–3 сторис, которые ведут к её ближайшему продукту или мероприятию (прогрев: польза → история →
+  отзыв/результат ученицы → приглашение). Если ближайших продуктов в памяти нет — сторис на доверие и близость.
+
+В конце:
+- «Совет: сними 2–3 ролика за один раз — так проще держать ритм 1 рилс в день.»
+- Если в памяти нет её ближайших курсов, интенсивов, ретритов и мероприятий с датами — спроси: «Какие у тебя
+  курсы, интенсивы и мероприятия в ближайший месяц? Напиши "Запомни: …" — буду вести к ним прогрев в сторис».
+Весь ответ — до ~5000 знаков. Не ссылайся на «алгоритм», досмотры и охваты — объясняй через зрителя.
+Личные истории не выдумывай — [вставь свою историю: …]. Пояснения на русском."""
+
+
+async def run_plan(update) -> None:
+    chat_id = update.effective_chat.id
+    status = await update.effective_message.reply_text("🗓 Собираю контент-план на неделю: смотрю, что залетает у конкурентов и у тебя. 1–3 минуты ⏳")
+    try:
+        result = await trends.collect(DATA_DIR)
+    except Exception:
+        logger.exception("Plan trends error")
+        await status.edit_text("Не получилось собрать данные для плана. Попробуй ещё раз через пару минут: /plan")
+        return
+    summary = trends.trends_text(result)
+    hooks = await _hook_transcripts(result["rows"])
+    if hooks:
+        summary += "\n\n[Что говорят в первые секунды залетевших роликов — дословная расшифровка]\n" + hooks
+    own = brief.own_hits_text(DATA_DIR)
+    if own:
+        summary += "\n\n" + own
+    try:
+        await status.edit_text("✅ Данные собрала. Пишу план…")
+    except BadRequest:
+        pass
+    content = summary + "\n\n" + PLAN_PROMPT
+    await ask_claude(update, chat_id, content, history_note="[Контент-план на неделю]", max_tokens=7000, edit=False)
+
+
+async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await run_plan(update)
+
+
+async def sunday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    for cid, on in _load_subs().items():
+        if not on:
+            continue
+        mode = _get_state(int(cid)).get("plan")
+        try:
+            if mode == "weekly":
+                await run_plan(_ChatProxy(context.bot, int(cid)))
+            elif mode is None:
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🗓 План на всю неделю (по воскресеньям)", callback_data="plan:w")],
+                    [InlineKeyboardButton("🌅 Каждое утро по одной теме", callback_data="plan:d")],
+                ])
+                await context.bot.send_message(
+                    int(cid),
+                    "Как тебе удобнее снимать?\n\n• План на неделю: по воскресеньям присылаю 7 тем с хуками и сторис — "
+                    "можно снять 2–3 ролика за раз.\n• Или каждое утро по одной теме вместе со сводкой.",
+                    reply_markup=kb,
+                )
+        except Exception:
+            logger.exception("sunday job error for %s", cid)
+
+
+async def on_plan_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    try:
+        await q.answer()
+    except BadRequest:
+        pass
+    chat_id = update.effective_chat.id
+    if q.data == "plan:w":
+        _set_state(chat_id, "plan", "weekly")
+        await update.effective_message.reply_text("Отлично! Каждое воскресенье пришлю план на неделю. Первый — прямо сейчас 👇")
+        await run_plan(update)
+    else:
+        _set_state(chat_id, "plan", "daily")
+        await update.effective_message.reply_text(
+            "Договорились: каждое утро вместе со сводкой — одна тема дня с хуком. План на неделю можно попросить в любой момент: /plan"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Сам пишет: утренняя сводка каждый день и итоги недели по понедельникам
 # ---------------------------------------------------------------------------
@@ -2520,8 +2646,15 @@ async def morning_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             continue
         try:
             _brief_cache.clear()
-            await run_brief(_ChatProxy(context.bot, int(cid)),
-                            "Доброе утро! (сводка пришла сама, по расписанию) Что у меня в Инстаграме и что снять сегодня?")
+            ask = "Доброе утро! (сводка пришла сама, по расписанию) Что у меня в Инстаграме и что снять сегодня?"
+            st = _get_state(int(cid))
+            last_v = st.get("last_video")
+            now_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
+            if not last_v or now_ts - last_v > 2 * 86400:
+                ask += " [Заметка бота: Анна уже 2+ дня не присылала готовое видео на проверку перед публикацией.]"
+            if st.get("plan") == "daily":
+                ask += " [Анна выбрала режим «каждый день по одной теме»: дай одну тему дня с хуком.]"
+            await run_brief(_ChatProxy(context.bot, int(cid)), ask)
         except Exception:
             logger.exception("morning job error for %s", cid)
 
@@ -2583,11 +2716,15 @@ def main() -> None:
     app.add_handler(CommandHandler("morning", guarded(start_morning)))
     app.add_handler(CommandHandler("stop_morning", guarded(stop_morning)))
     app.add_handler(CommandHandler("week", guarded(week_command)))
+    app.add_handler(CommandHandler("plan", guarded(plan_command)))
+    app.add_handler(CallbackQueryHandler(guarded(on_plan_button), pattern=r"^plan:"))
     if MORNING_ENABLED and app.job_queue is not None:
         t = datetime.time(hour=MORNING_HOUR, minute=0, tzinfo=audit.LOCAL_TZ)
         app.job_queue.run_daily(morning_job, t, name="morning")
         app.job_queue.run_daily(weekly_job, datetime.time(hour=MORNING_HOUR, minute=5, tzinfo=audit.LOCAL_TZ),
                                 days=(1,), name="weekly")  # PTB 21: 0 = воскресенье, 1 = понедельник
+        app.job_queue.run_daily(sunday_job, datetime.time(hour=18, minute=0, tzinfo=audit.LOCAL_TZ),
+                                days=(0,), name="sunday_plan")
         logger.info("Утренняя сводка: каждый день в %s:00", MORNING_HOUR)
     elif MORNING_ENABLED:
         logger.warning("JobQueue недоступна — установи python-telegram-bot[job-queue]")
