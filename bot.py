@@ -292,10 +292,145 @@ def _cache_last_message(messages: list[dict]) -> list[dict]:
     return msgs
 
 
+# ---------------------------------------------------------------------------
+# Учёт расходов на Claude (оценка по токенам) + предупреждения владельцу
+# ---------------------------------------------------------------------------
+_PRICES = {  # $ за 1M токенов: вход, из кэша, запись в кэш (1ч), выход
+    "haiku": (1.0, 0.10, 2.0, 5.0),
+    "sonnet": (3.0, 0.30, 6.0, 15.0),
+    "opus": (5.0, 0.50, 10.0, 25.0),
+}
+HEAVY_DAILY_LIMIT = int(os.environ.get("HEAVY_DAILY_LIMIT", "5"))
+LOW_BALANCE_USD = float(os.environ.get("LOW_BALANCE_USD", "2"))
+_pending_alerts: list[str] = []
+
+
+def _spend_path() -> str:
+    return os.path.join(DATA_DIR, "spend.json")
+
+
+def _load_spend() -> dict:
+    try:
+        with open(_spend_path(), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {"total": 0.0, "days": {}}
+
+
+def _save_spend(d: dict) -> None:
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(_spend_path(), "w", encoding="utf-8") as f:
+            json.dump(d, f)
+    except OSError:
+        logger.exception("spend save error")
+
+
+def _add_spend(model: str, u) -> None:
+    key = next((k for k in _PRICES if k in (model or "").lower()), "sonnet")
+    p_in, p_cr, p_cw, p_out = _PRICES[key]
+    usd = ((getattr(u, "input_tokens", 0) or 0) * p_in + (getattr(u, "cache_read_input_tokens", 0) or 0) * p_cr
+           + (getattr(u, "cache_creation_input_tokens", 0) or 0) * p_cw + (getattr(u, "output_tokens", 0) or 0) * p_out) / 1e6
+    d = _load_spend()
+    day = datetime.datetime.now(audit.LOCAL_TZ).strftime("%Y-%m-%d")
+    d["total"] = d.get("total", 0.0) + usd
+    d.setdefault("days", {})[day] = d["days"].get(day, 0.0) + usd
+    d["days"] = dict(sorted(d["days"].items())[-60:])
+    bal = d.get("balance")
+    if bal:
+        left = bal["usd"] - (d["total"] - bal["spent_at_set"])
+        if left < LOW_BALANCE_USD and not bal.get("warned"):
+            bal["warned"] = True
+            _pending_alerts.append(
+                f"[!] На счёте Claude осталось примерно ${max(left, 0):.2f} (оценка бота). "
+                "Пополни: platform.claude.com → Billing → Buy credits, потом напиши мне /balance и сумму на счёте."
+            )
+    _save_spend(d)
+
+
+def spend_week() -> float:
+    d = _load_spend().get("days", {})
+    since = (datetime.datetime.now(audit.LOCAL_TZ) - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+    return sum(v for k, v in d.items() if k > since)
+
+
+def _owner_chats() -> list[int]:
+    return [int(cid) for cid, st in _all_state().items() if st.get("owner")]
+
+
+async def _flush_alerts(bot) -> None:
+    while _pending_alerts:
+        text = _pending_alerts.pop(0)
+        for cid in _owner_chats():
+            try:
+                await bot.send_message(cid, text)
+            except Exception:
+                logger.exception("owner alert error")
+
+
+async def _heavy_ok(update) -> bool:
+    """Не больше HEAVY_DAILY_LIMIT тяжёлых запросов в день на чат (сценарии, план, разбор видео, аудит).
+    Сообщения по расписанию лимит не тратят."""
+    if isinstance(update, _ChatProxy) or HEAVY_DAILY_LIMIT <= 0:
+        return True
+    cid = update.effective_chat.id
+    st = _get_state(cid)
+    if st.get("owner"):
+        return True
+    day = datetime.datetime.now(audit.LOCAL_TZ).strftime("%Y-%m-%d")
+    n = st.get("heavy_n", 0) if st.get("heavy_day") == day else 0
+    if n >= HEAVY_DAILY_LIMIT:
+        await update.effective_message.reply_text(
+            f"На сегодня большие разборы закончились ({HEAVY_DAILY_LIMIT} из {HEAVY_DAILY_LIMIT}) 🙏 "
+            "Сценарии, план и проверку видео продолжим завтра утром. А на обычные вопросы отвечу и сейчас."
+        )
+        return False
+    _set_state(cid, "heavy_day", day)
+    _set_state(cid, "heavy_n", n + 1)
+    return True
+
+
+async def owner_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _set_state(update.effective_chat.id, "owner", True)
+    await update.message.reply_text(
+        "Готово: ты владелец бота. Сюда буду писать, если на счёте Claude останется мало денег, "
+        "и для тебя нет дневного лимита. Напиши /balance 10 — сколько сейчас долларов на счёте Claude, "
+        "чтобы я считала остаток."
+    )
+
+
+async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    d = _load_spend()
+    args = context.args or []
+    if args:
+        try:
+            usd = float(args[0].replace(",", ".").lstrip("$"))
+        except ValueError:
+            await update.message.reply_text("Напиши так: /balance 10 — сколько долларов сейчас на счёте Claude.")
+            return
+        d["balance"] = {"usd": usd, "spent_at_set": d.get("total", 0.0), "warned": False}
+        _save_spend(d)
+        await update.message.reply_text(f"Запомнила: на счёте ${usd:.2f}. Предупрежу, когда останется меньше ${LOW_BALANCE_USD:.0f}.")
+        return
+    bal = d.get("balance")
+    lines = [f"Расходы на ИИ за 7 дней: ≈ ${spend_week():.2f}"]
+    today = datetime.datetime.now(audit.LOCAL_TZ).strftime("%Y-%m-%d")
+    lines.append(f"Сегодня: ≈ ${d.get('days', {}).get(today, 0.0):.2f}")
+    if bal:
+        lines.append(f"Остаток на счёте Claude: ≈ ${bal['usd'] - (d.get('total', 0.0) - bal['spent_at_set']):.2f} (оценка)")
+    else:
+        lines.append("Остаток не знаю: напиши /balance 10 — сколько сейчас на счёте Claude.")
+    await update.message.reply_text("\n".join(lines))
+
+
 def _log_usage(where: str, response) -> None:
     u = getattr(response, "usage", None)
     if u is None:
         return
+    try:
+        _add_spend(getattr(response, "model", "") or "", u)
+    except Exception:
+        logger.exception("spend tracking error")
     logger.info(
         "Токены [%s]: вход %s, из кэша %s, в кэш %s, выход %s", where,
         getattr(u, "input_tokens", 0), getattr(u, "cache_read_input_tokens", 0) or 0,
@@ -408,6 +543,9 @@ async def ask_claude(
             logger.exception("Anthropic API error")
             if e.status_code == 529 or e.status_code >= 500:
                 msg = "Claude сейчас перегружен. Попробуй ещё раз через минуту 🙏"
+            elif "credit balance" in str(e).lower():
+                msg = "У меня закончился баланс на ИИ 🙏 Попроси Никиту пополнить счёт — и я сразу продолжу."
+                _pending_alerts.append("[!] Баланс Claude закончился — бот не может отвечать. Пополни: platform.claude.com → Billing → Buy credits.")
             elif e.status_code == 429:
                 msg = "Слишком много запросов подряд. Подожди минутку и повтори."
             else:
@@ -677,6 +815,8 @@ async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def run_audit(update: Update, handle: str, extra: str = "") -> None:
+    if not await _heavy_ok(update):
+        return
     """Выгружает аккаунт, считает статистику и просит Claude сделать аудит."""
     handle = handle.lstrip("@")
     is_client = handle.lower() == audit.CLIENT_INSTAGRAM.lower()
@@ -1729,6 +1869,8 @@ async def _hook_transcripts(rows: list[dict], limit: int = 4, seconds: int = 6) 
 
 async def run_hits(update: Update, topic: str = "") -> None:
     chat_id = update.effective_chat.id
+    if not await _heavy_ok(update):
+        return
     status = await update.effective_message.reply_text(
         "🔥 Ищу ролики, которые залетели у конкурентов и в нише, и разбираю, почему. 1–3 минуты ⏳"
     )
@@ -2026,6 +2168,8 @@ async def on_video_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def review_videos(update: Update, paths: list[str], caption: str) -> None:
     """Продюсерский разбор одного или нескольких роликов (речь + кадры) — одним ответом."""
+    if not await _heavy_ok(update):
+        return
     _set_state(update.effective_chat.id, "last_video", datetime.datetime.now(datetime.timezone.utc).timestamp())
     status = await update.effective_message.reply_text("🎬 Смотрю и слушаю ролик — проверю перед публикацией. Это займёт до минуты ⏳")
     await update.effective_chat.send_action("typing")
@@ -2516,6 +2660,8 @@ PLAN_PROMPT = """Составь Анне контент-план на недел
 
 async def run_plan(update) -> None:
     chat_id = update.effective_chat.id
+    if not await _heavy_ok(update):
+        return
     status = await update.effective_message.reply_text("🗓 Собираю контент-план на неделю: смотрю, что залетает у конкурентов и у тебя. 1–3 минуты ⏳")
     try:
         result = await trends.collect(DATA_DIR)
@@ -2640,6 +2786,10 @@ class _ChatProxy:
         return await self._bot.send_message(self.id, text, **kw)
 
 
+async def alerts_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _flush_alerts(context.bot)
+
+
 async def morning_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     for cid, on in _load_subs().items():
         if not on:
@@ -2661,6 +2811,11 @@ async def morning_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def weekly_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     text = brief.weekly_text(DATA_DIR)
+    for cid in _owner_chats():
+        try:
+            await context.bot.send_message(cid, f"Расходы бота на ИИ за неделю: ≈ ${spend_week():.2f}. Подробно: /balance")
+        except Exception:
+            logger.exception("owner weekly spend error")
     if not text:
         return
     for cid, on in _load_subs().items():
@@ -2717,12 +2872,15 @@ def main() -> None:
     app.add_handler(CommandHandler("stop_morning", guarded(stop_morning)))
     app.add_handler(CommandHandler("week", guarded(week_command)))
     app.add_handler(CommandHandler("plan", guarded(plan_command)))
+    app.add_handler(CommandHandler("owner", guarded(owner_command)))
+    app.add_handler(CommandHandler("balance", guarded(balance_command)))
     app.add_handler(CallbackQueryHandler(guarded(on_plan_button), pattern=r"^plan:"))
     if MORNING_ENABLED and app.job_queue is not None:
         t = datetime.time(hour=MORNING_HOUR, minute=0, tzinfo=audit.LOCAL_TZ)
         app.job_queue.run_daily(morning_job, t, name="morning")
         app.job_queue.run_daily(weekly_job, datetime.time(hour=MORNING_HOUR, minute=5, tzinfo=audit.LOCAL_TZ),
                                 days=(1,), name="weekly")  # PTB 21: 0 = воскресенье, 1 = понедельник
+        app.job_queue.run_repeating(alerts_job, interval=300, first=60, name="alerts")
         app.job_queue.run_daily(sunday_job, datetime.time(hour=18, minute=0, tzinfo=audit.LOCAL_TZ),
                                 days=(0,), name="sunday_plan")
         logger.info("Утренняя сводка: каждый день в %s:00", MORNING_HOUR)
