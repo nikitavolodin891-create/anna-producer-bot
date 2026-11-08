@@ -602,6 +602,7 @@ HELP_TEXT = (
     "• Скрин статистики — разберу цифры · фото, PDF, сайты\n"
     "• Голосовые и кружки 🎙 · поиск в интернете 🔎 · любые вопросы\n"
     "• «Запомни: …» — запомню факт, /memory — что я помню\n"
+    "• /morning — сводка сама каждое утро + итоги недели по понедельникам (/stop_morning — выключить), /week — итоги недели сейчас\n"
     "• /new — начать диалог заново"
 )
 
@@ -1749,12 +1750,17 @@ BRIEF_PROMPT = """Сделай Анне утреннюю сводку по её 
 - Не рассуждай о том, что «видит», «любит» или «наказывает» алгоритм, — это догадки. Объясняй через людей:
   что зритель почувствовал, почему остановился или пролистал.
 - Если в данных есть пометка «[!] ДУБЛЬ» — прямо скажи, что ролик выложен повторно, и что частоту накручивают дубли.
+- Если есть «[!] СЛИШКОМ ЧАСТО» — прямо скажи: ролики отбирают охват друг у друга, норма — 1 рилс в день.
+- Если у слабых роликов пометка «[!] ДЛИННЫЙ» — скажи, что длинные ролики почти не досматривают, держать до 60 секунд.
+- Если есть строка «Язык подписи и просмотры» и один язык заметно сильнее (в 1,5+ раза) — скажи, на каком языке
+  её смотрят лучше, и посоветуй чаще снимать на нём. Если разница небольшая — не упоминай.
 - Не выдумывай личные истории Анны — где нужна история, пиши [вставь свою реальную историю: …].
 Только русский. Без таблиц."""
 
 
-async def run_brief(update: Update, text: str) -> None:
+async def run_brief(update, text: str) -> None:
     chat_id = update.effective_chat.id
+    _subscribe(chat_id)
     handle = audit.CLIENT_INSTAGRAM
     cached = _brief_cache.get(handle)
     now = asyncio.get_event_loop().time()
@@ -1777,6 +1783,7 @@ async def run_brief(update: Update, text: str) -> None:
         prev = brief.load_snapshot(DATA_DIR)
         try:
             brief.save_snapshot(DATA_DIR, brief.make_snapshot(stats))
+            brief.add_history(DATA_DIR, stats)
         except OSError:
             logger.exception("Brief snapshot save error")
         _brief_cache[handle] = {"t": now, "stats": stats, "prev": prev}
@@ -2398,6 +2405,110 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Необработанная ошибка", exc_info=context.error)
 
 
+# ---------------------------------------------------------------------------
+# Сам пишет: утренняя сводка каждый день и итоги недели по понедельникам
+# ---------------------------------------------------------------------------
+MORNING_HOUR = int(os.environ.get("MORNING_HOUR", "9"))  # по времени Анны (audit.LOCAL_TZ)
+MORNING_ENABLED = os.environ.get("MORNING_ENABLED", "1") != "0"
+
+
+def _subs_path() -> str:
+    return os.path.join(DATA_DIR, "morning_chats.json")
+
+
+def _load_subs() -> dict:
+    try:
+        with open(_subs_path(), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_subs(d: dict) -> None:
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(_subs_path(), "w", encoding="utf-8") as f:
+            json.dump(d, f)
+    except OSError:
+        logger.exception("morning subs save error")
+
+
+def _subscribe(chat_id: int) -> None:
+    d = _load_subs()
+    if str(chat_id) not in d:  # кто однажды попросил сводку — получает её каждое утро (выключить: /stop_morning)
+        d[str(chat_id)] = True
+        _save_subs(d)
+
+
+class _ChatProxy:
+    """Мини-«Update» для сообщений по расписанию: бот пишет сам, без входящего сообщения."""
+
+    def __init__(self, bot, chat_id: int):
+        self.id = chat_id
+        self._bot = bot
+        self.effective_chat = self
+        self.effective_message = self
+        self.message = self
+
+    async def send_action(self, action):
+        try:
+            await self._bot.send_chat_action(self.id, action)
+        except Exception:
+            pass
+
+    async def reply_text(self, text, **kw):
+        kw.pop("reply_to_message_id", None)
+        kw.pop("quote", None)
+        return await self._bot.send_message(self.id, text, **kw)
+
+
+async def morning_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    for cid, on in _load_subs().items():
+        if not on:
+            continue
+        try:
+            _brief_cache.clear()
+            await run_brief(_ChatProxy(context.bot, int(cid)),
+                            "Доброе утро! (сводка пришла сама, по расписанию) Что у меня в Инстаграме и что снять сегодня?")
+        except Exception:
+            logger.exception("morning job error for %s", cid)
+
+
+async def weekly_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = brief.weekly_text(DATA_DIR)
+    if not text:
+        return
+    for cid, on in _load_subs().items():
+        if on:
+            try:
+                await context.bot.send_message(int(cid), text, disable_web_page_preview=True)
+            except Exception:
+                logger.exception("weekly job error for %s", cid)
+
+
+async def stop_morning(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    d = _load_subs()
+    d[str(update.effective_chat.id)] = False
+    _save_subs(d)
+    await update.message.reply_text("Ок, утренние сводки выключены. Включить снова: /morning")
+
+
+async def start_morning(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    d = _load_subs()
+    d[str(update.effective_chat.id)] = True
+    _save_subs(d)
+    await update.message.reply_text(
+        f"Готово! Каждое утро в {MORNING_HOUR}:00 пришлю сводку по Инстаграму, а по понедельникам — итоги недели. "
+        "Выключить: /stop_morning"
+    )
+
+
+async def week_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = brief.weekly_text(DATA_DIR)
+    await update.message.reply_text(text or "Пока мало данных для недельного отчёта — нужно хотя бы 2 дня сводок.",
+                                    disable_web_page_preview=True)
+
+
 def main() -> None:
     # Свой (self-hosted) Telegram Bot API сервер — снимает лимит 20 МБ на скачивание файлов.
     # Сервер и бот работают в одном контейнере (см. start.sh) и делят общий диск.
@@ -2417,6 +2528,17 @@ def main() -> None:
     app.add_handler(CommandHandler("id", show_id))
     app.add_handler(CommandHandler("start", guarded(start)))
     app.add_handler(CommandHandler("new", guarded(new_dialog)))
+    app.add_handler(CommandHandler("morning", guarded(start_morning)))
+    app.add_handler(CommandHandler("stop_morning", guarded(stop_morning)))
+    app.add_handler(CommandHandler("week", guarded(week_command)))
+    if MORNING_ENABLED and app.job_queue is not None:
+        t = datetime.time(hour=MORNING_HOUR, minute=0, tzinfo=audit.LOCAL_TZ)
+        app.job_queue.run_daily(morning_job, t, name="morning")
+        app.job_queue.run_daily(weekly_job, datetime.time(hour=MORNING_HOUR, minute=5, tzinfo=audit.LOCAL_TZ),
+                                days=(1,), name="weekly")  # PTB 21: 0 = воскресенье, 1 = понедельник
+        logger.info("Утренняя сводка: каждый день в %s:00", MORNING_HOUR)
+    elif MORNING_ENABLED:
+        logger.warning("JobQueue недоступна — установи python-telegram-bot[job-queue]")
     app.add_handler(CommandHandler("help", guarded(help_command)))
     app.add_handler(CommandHandler("memory", guarded(memory_command)))
     app.add_handler(CommandHandler("forget", guarded(forget_command)))
