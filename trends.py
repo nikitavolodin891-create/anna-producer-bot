@@ -50,13 +50,25 @@ def _path(data_dir: str, name: str) -> str:
     return os.path.join(data_dir, name)
 
 
+# Базовые ориентиры ниши (женские деньги, отношения, психология; рус/укр). Свои добавляются через /competitors.
+DEFAULT_COMPETITORS = [
+    "vladymyrova.nataliya", "aleksa_pentina", "anastasia_katrich_", "annakolo1",
+    "metamorfozu", "levitskaya_viktoria", "krapivina.anastasya",
+]
+
+
 def load_competitors(data_dir: str) -> list[str]:
     try:
         with open(_path(data_dir, "competitors.json"), encoding="utf-8") as f:
-            return json.load(f)
+            own = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         env = os.environ.get("NICHE_ACCOUNTS", "")
-        return [a.strip().lstrip("@") for a in env.split(",") if a.strip()]
+        own = [a.strip().lstrip("@") for a in env.split(",") if a.strip()]
+    out = []
+    for h in list(own) + DEFAULT_COMPETITORS:
+        if h and h not in out:
+            out.append(h)
+    return out[:10]
 
 
 def save_competitors(data_dir: str, handles: list[str]) -> None:
