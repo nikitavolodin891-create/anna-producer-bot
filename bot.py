@@ -507,6 +507,10 @@ async def _create(system: str, messages: list[dict], max_tokens: int, web_search
             else:
                 response = await client.messages.create(messages=msgs, **kwargs)
         except (anthropic.NotFoundError, anthropic.BadRequestError) as e:
+            if "thinking" in kwargs and "thinking" in str(e).lower():
+                logger.warning("Режим размышления недоступен, отвечаю без него: %s", e)
+                kwargs.pop("thinking")
+                continue
             if kwargs["model"] != CLAUDE_MODEL and "model" in str(e).lower():
                 logger.warning("Быстрая модель %s недоступна, отвечаю основной: %s", kwargs["model"], e)
                 kwargs["model"] = CLAUDE_MODEL
