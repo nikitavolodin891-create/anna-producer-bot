@@ -37,6 +37,7 @@ import vidiq
 import anna_profile
 import launches
 import rotation
+import hitmaker
 import datetime
 from telegram import InputMediaPhoto, InputMediaDocument, InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -483,7 +484,8 @@ def _web_search_tool() -> dict:
     return {"type": "web_search_20250305", "name": "web_search", "max_uses": WEB_SEARCH_MAX_USES}
 
 
-async def _create(system: str, messages: list[dict], max_tokens: int, web_search: bool, model: str | None = None):
+async def _create(system: str, messages: list[dict], max_tokens: int, web_search: bool, model: str | None = None,
+                  thinking: int = 0):
     """Запрос к Claude с (необязательным) поиском в интернете.
 
     Возвращает (текст, stop_reason, источники). Поиск идёт на стороне Anthropic: модель сама решает,
@@ -491,6 +493,9 @@ async def _create(system: str, messages: list[dict], max_tokens: int, web_search
     Если поиск выключен в организации Anthropic (400), повторяем запрос без него.
     """
     kwargs = {"model": model or CLAUDE_MODEL, "max_tokens": max_tokens, "system": _system_blocks(system)}
+    if thinking and not model:  # «подумать как продюсер» перед ответом: идеи → оценка → лучшие
+        kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking}
+        kwargs["max_tokens"] = max(max_tokens, thinking + 4000)
     use_search = web_search and WEB_SEARCH_ENABLED
     msgs = _cache_last_message(list(messages))
     texts: list[str] = []
@@ -554,6 +559,7 @@ async def ask_claude(
     edit: bool = True,
     history_reply=None,
     model: str | None = None,
+    thinking: int = 0,
 ) -> str | None:
     """Единая точка общения с Claude. Возвращает полный ответ (или None при ошибке).
 
@@ -576,7 +582,7 @@ async def ask_claude(
         try:
             system = system_with_search() if (web_search and WEB_SEARCH_ENABLED) else current_system_prompt()
             reply_text, stop_reason, sources = await _create(
-                system, messages, max_tokens or CLAUDE_MAX_TOKENS, web_search, model=model
+                system, messages, max_tokens or CLAUDE_MAX_TOKENS, web_search, model=model, thinking=thinking
             )
             if edit and stop_reason != "max_tokens" and needs_editing(reply_text):
                 reply_text = await edit_draft(reply_text, max_tokens or CLAUDE_MAX_TOKENS)
@@ -1117,7 +1123,9 @@ async def process_user_text(update: Update, user_text: str) -> None:
         if kind == "new":
             await run_montage(update, user_text, _pending_videos.pop(chat_id, None) or recent_videos(chat_id))
             return
-        if HITS_INTENT_RE.search(user_text) or (YES_RE.match(user_text) and _recent_mode(chat_id) in ("brief", "audit")):
+        if (HIT_REQ_RE.search(user_text) and not re.search(r"(перепиш|передела|исправ|сократ|подпис)", user_text, re.I)) \
+                or HITS_INTENT_RE.search(user_text) \
+                or (YES_RE.match(user_text) and _recent_mode(chat_id) in ("brief", "audit")):
             await run_hits(update, "" if YES_RE.match(user_text) else user_text)
             return
         if BRIEF_INTENT_RE.search(user_text) and not AUDIT_INTENT_RE.search(user_text):
@@ -1840,6 +1848,14 @@ async def save_telegram_file(tg_file, dst: str) -> None:
 # ---------------------------------------------------------------------------
 # «Давай исправим» → сценарии по механике залетевших роликов ниши и конкурентов
 # ---------------------------------------------------------------------------
+HITS_THINKING = int(os.environ.get("HITS_THINKING", "6000"))
+DAILY_THINKING = int(os.environ.get("DAILY_THINKING", "3000"))
+# «дай сценарий», «сценарии», «хиты», «придумай рилс» — сразу продюсерский разбор с 3 хитами
+HIT_REQ_RE = re.compile(
+    r"(^\s*(сценари\w*|хит\w*)\s*[!.?]*\s*$|(дай|давай|напиши|придумай|сделай|хочу|нужн\w*|покажи)\s.{0,25}"
+    r"(сценари|хит|рилс|ролик|reels))",
+    re.I,
+)
 HITS_INTENT_RE = re.compile(
     r"(давай\s+(это\s+)?(исправ|сним|снима|переделыва)|как\s+(это\s+|всё\s+|все\s+)?исправ|что\s+(мне\s+)?(снять|снимать)|"
     r"какой\s+(рилс|ролик)\s+(снять|снимать)|как\s+у\s+конкурент|у\s+конкурентов|залетевш|миллионник|"
@@ -1980,9 +1996,10 @@ async def run_hits(update: Update, topic: str = "") -> None:
         content.append({"type": "text", "text": f"Обложка {label}"})
         content.append(social.image_block(data_bytes, mime))
     topic_line = f"\n\nЗапрос Анны: {topic.strip()[:300]}" if topic.strip() else ""
-    content.append({"type": "text", "text": HITS_PROMPT.format(topic=topic_line)})
+    content.append({"type": "text", "text": hitmaker.HITS_PRO_PROMPT.format(topic=topic_line)})
     note = summary[:2000] + "\n\n[Сценарии по залетевшим роликам]" + (f" {topic.strip()[:200]}" if topic.strip() else "")
-    reply = await ask_claude(update, chat_id, content, history_note=note, max_tokens=5000, edit=False)
+    reply = await ask_claude(update, chat_id, content, history_note=note, max_tokens=7000, edit=False,
+                             thinking=HITS_THINKING)
     if reply:
         _mark_mode(chat_id, "hits")
         m = MEMORY_RE.search(reply)
@@ -2133,7 +2150,8 @@ DAILY_PROMPT = """Ты — личный продюсер Анны. Сейчас 
    Кодовое слово в подписи — на бесплатную практику («пиши "жіночність" — надішлю практику»), не на курс.
    Курс живёт ТОЛЬКО в сторис.
    Для каждого рилса:
-   **Рилс 1 — тема** · формат и тема — СТРОГО из блока «ФОРМАТ И ТЕМА НА СЕГОДНЯ» (Рилс 1 — первый выбор,
+   Про себя придумай 5 идей под формат и тему дня, оцени по блоку «КАК ОЦЕНИВАТЬ ИДЕЮ», покажи только лучшую (8+).
+   **Рилс 1 — тема — оценка X/10** · формат и тема — СТРОГО из блока «ФОРМАТ И ТЕМА НА СЕГОДНЯ» (Рилс 1 — первый выбор,
    Рилс 2 — второй) · длина N секунд · язык · когда выложить
    - Почему этот: на какой её хит или залетевший ролик ниши опирается (с цифрами)
    Дальше ДВА ПОЛНЫХ НЕЗАВИСИМЫХ ВАРИАНТА одного рилса (одна тема, разные способы снять — НЕ смешивай их):
@@ -2229,6 +2247,7 @@ async def _run_daily_plan(update, chat_id: int, facts_text: str, text: str, stat
     if now.hour >= 18:
         when += "Уже вечер — снимать и выкладывать новое лучше завтра. "
     summary += "\n\n" + launches.today_block(today)
+    summary += "\n\n" + hitmaker.MECHANICS + "\n" + hitmaker.RUBRIC
     picks, rot = rotation.pick(_get_state(chat_id), today, launches.today_reels(today))
     summary += "\n\n" + rotation.plan_text(picks)
     past = _get_state(chat_id).get("plans") or []
@@ -2237,7 +2256,8 @@ async def _run_daily_plan(update, chat_id: int, facts_text: str, text: str, stat
                     + "\n---\n".join(f"{p['date']}:\n{p['text']}" for p in past[-3:]))
     content = summary + "\n\n" + DAILY_PROMPT.format(text=text.strip()[:400], plan=when + launches.today_plan_line(today))
     note = facts_text[:2000] + "\n\n[План съёмки на сегодня]"
-    reply = await ask_claude(update, chat_id, content, history_note=note, max_tokens=8000, edit=False)
+    reply = await ask_claude(update, chat_id, content, history_note=note, max_tokens=8000, edit=False,
+                             thinking=DAILY_THINKING)
     if reply:
         _mark_mode(chat_id, "hits")
         plans = (_get_state(chat_id).get("plans") or [])[-4:]
@@ -2256,6 +2276,10 @@ def _plan_digest(reply: str) -> str:
         if re.search(r"(Рилс \d|Хук|Вариант А|⭐|Цель на|пролистали сразу ниже|досмотр выше|Формат)", l):
             keep.append(l[:220])
     return "\n".join(keep)[:1200] or reply[:800]
+
+
+async def hits_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await run_hits(update, " ".join(context.args or []))
 
 
 async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3147,6 +3171,7 @@ def main() -> None:
     app.add_handler(CommandHandler("week", guarded(week_command)))
     app.add_handler(CommandHandler("plan", guarded(plan_command)))
     app.add_handler(CommandHandler("today", guarded(today_command)))
+    app.add_handler(CommandHandler("hits", guarded(hits_command)))
     app.add_handler(CommandHandler("owner", guarded(owner_command)))
     app.add_handler(CommandHandler("balance", guarded(balance_command)))
     app.add_handler(CommandHandler("vidiq", guarded(vidiq_command)))
