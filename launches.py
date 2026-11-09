@@ -156,3 +156,14 @@ def today_plan_line(today: datetime.date) -> str:
     name, reels, stories, _ = _phase(d)
     when = "сегодня старт" if d == 0 else f"до старта {d} дн."
     return f"{L['name']}: {when}, фаза {name} — рилсов {reels}, сторис {stories}, кодовое слово «{L['cta']}»."
+
+
+def today_reels(today: datetime.date) -> int:
+    """Сколько рилсов на сегодня по фазе запуска (вне запусков — 2)."""
+    best = None
+    for L in LAUNCHES:
+        if L.get("start"):
+            d = (L["start"] - today).days
+            if d >= 0 and _phase(d) and (best is None or d < best):
+                best = d
+    return _phase(best)[1] if best is not None else 2
