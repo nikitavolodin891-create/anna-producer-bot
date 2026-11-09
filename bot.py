@@ -8,6 +8,7 @@ import logging
 import asyncio
 import tempfile
 import shutil
+import time
 from collections import defaultdict
 
 import httpx
@@ -31,6 +32,8 @@ import carousel
 import design_store
 import montage
 import brief
+import iginsights
+import vidiq
 import datetime
 from telegram import InputMediaPhoto, InputMediaDocument, InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -745,6 +748,7 @@ HELP_TEXT = (
     "• Голосовые и кружки 🎙 · поиск в интернете 🔎 · любые вопросы\n"
     "• «Запомни: …» — запомню факт, /memory — что я помню\n"
     "• /morning — сводка сама каждое утро + итоги недели по понедельникам (/stop_morning — выключить), /week — итоги недели сейчас\n"
+    "• /today — план съёмки на сегодня: что просело, сколько рилсов снять, хуки и сценарии (приходит сам в 9:00)\n"
     "• /plan — контент-план на неделю: 7 рилсов + сторис-прогрев к твоим курсам и мероприятиям\n"
     "• /new — начать диалог заново"
 )
@@ -1825,6 +1829,37 @@ def _recent_mode(chat_id: int, within: float = 12 * 3600) -> str | None:
     return None
 
 
+_ig_cache: dict = {}
+
+
+async def _ig_insights_text(stats: dict | None = None) -> str:
+    """Официальная статистика из Instagram API (если в Railway добавлен IG_ACCESS_TOKEN). Кэш 3 часа."""
+    if not iginsights.enabled(DATA_DIR):
+        return ""
+    now = time.time()
+    if _ig_cache.get("t", 0) > now - 3 * 3600 and _ig_cache.get("data"):
+        data = _ig_cache["data"]
+    else:
+        try:
+            data = await iginsights.fetch(DATA_DIR)
+        except Exception as e:
+            logger.warning("Instagram API: %s", e)
+            return ""
+        _ig_cache.update(t=now, data=data)
+    durations = {r["code"]: r["duration"] for r in (stats or {}).get("rows", []) if r.get("code") and r.get("duration")}
+    return iginsights.insights_text(data, durations)
+
+
+async def _owner_stats_text(stats: dict | None = None) -> str:
+    """Внутренняя статистика: сначала vidIQ (VIDIQ_API_KEY), иначе официальный ключ Instagram (IG_ACCESS_TOKEN)."""
+    if vidiq.enabled():
+        try:
+            return vidiq.reels_text(await vidiq.fetch_reels(), audit.LOCAL_TZ)
+        except Exception as e:
+            logger.warning("vidIQ: %s", e)
+    return await _ig_insights_text(stats)
+
+
 _hook_cache: dict[str, str] = {}
 
 
@@ -1898,6 +1933,9 @@ async def run_hits(update: Update, topic: str = "") -> None:
     own = brief.own_hits_text(DATA_DIR)
     if own:
         summary += "\n\n" + own
+    ig = await _owner_stats_text()
+    if ig:
+        summary += "\n\n" + ig
     content: list[dict] = [{"type": "text", "text": summary}]
     for label, data_bytes, mime in await trends.covers(result, limit=3):
         content.append({"type": "text", "text": f"Обложка {label}"})
@@ -1955,6 +1993,11 @@ BRIEF_PROMPT = """Сделай Анне утреннюю сводку по её 
   «Сняла что-то? Пришли мне перед публикацией — проверю хук и первые секунды».
 - Если Анна выбрала «каждый день по одной теме» — после «Что изменить» добавь блок **Тема дня**: тема, хук дословно,
   текст на экране, формат до 60 секунд.
+- Если есть блок «Внутренняя статистика Instagram» или «Официальная статистика Instagram» — тогда досмотры,
+  «пролистали сразу», репосты и сохранения у тебя ЕСТЬ (запрет выше на них не действует) — опирайся прежде всего на него: какую долю ролика досматривают
+  (среднее время просмотра из длины), % сохранений и репостов от охвата. Объясняй «почему просело» через эти цифры
+  (например: «смотрят в среднем 4 секунды из 45 — хук не держит»). Если есть вопросы зрителей из комментариев —
+  одной строкой предложи снять ролик-ответ на самый частый.
 - Если есть «[!] СЛИШКОМ ЧАСТО» — прямо скажи: ролики отбирают охват друг у друга, норма — 1 рилс в день.
 - Если у слабых роликов пометка «[!] ДЛИННЫЙ» — скажи, что длинные ролики почти не досматривают, держать до 60 секунд.
 - Если есть строка «Язык подписи и просмотры» и один язык заметно сильнее (в 1,5+ раза) — скажи, на каком языке
@@ -1963,7 +2006,7 @@ BRIEF_PROMPT = """Сделай Анне утреннюю сводку по её 
 Только русский. Без таблиц."""
 
 
-async def run_brief(update, text: str) -> None:
+async def run_brief(update, text: str, daily: bool = False) -> None:
     chat_id = update.effective_chat.id
     _subscribe(chat_id)
     handle = audit.CLIENT_INSTAGRAM
@@ -1994,6 +2037,12 @@ async def run_brief(update, text: str) -> None:
         _brief_cache[handle] = {"t": now, "stats": stats, "prev": prev}
     now_local = datetime.datetime.now(audit.LOCAL_TZ)
     facts_text = brief.brief_text(stats, prev, now_local)
+    ig = await _owner_stats_text(stats)
+    if ig:
+        facts_text += "\n\n" + ig
+    if daily:
+        await _run_daily_plan(update, chat_id, facts_text, text, status)
+        return
     if status:
         try:
             await status.edit_text("✅ Посмотрела. Собираю сводку…")
@@ -2003,6 +2052,87 @@ async def run_brief(update, text: str) -> None:
     note = facts_text[:2000] + f"\n\n[Утренняя сводка по запросу Анны: {text.strip()[:200]}]"
     if await ask_claude(update, chat_id, content, history_note=note, max_tokens=2500, edit=False):
         _mark_mode(chat_id, "brief")
+
+
+DAILY_PROMPT = """Ты — личный продюсер Анны. Сейчас 9 утра, это ежедневный план: что снять СЕГОДНЯ, чтобы аккаунт рос.
+Выше — реальные цифры, посчитанные кодом: её публикации, внутренняя статистика (если есть блок: «пролистали сразу»,
+досмотр, репосты, сохранения), её хиты и провалы, залетевшие ролики ниши и что в них говорят в первые секунды.
+Сообщение / заметки бота: «{text}».
+
+Структура (весь ответ до ~4500 знаков, без таблиц, только русский в пояснениях):
+
+1. Приветствие одной строкой.
+
+2. **Что происходит** — 3–5 строк по цифрам. Главная проблема прямо сейчас и где теряем людей:
+   - пролистывают в первые секунды (выше ~45%) → хук не цепляет;
+   - смотрят малую долю ролика → затянуто или слишком длинно;
+   - смотрят, но мало репостов/сохранений → нет эмоции или пользы, которой хочется поделиться;
+   - мало новых подписчиков → нет причины подписаться: не ясно, что ещё будет в блоге, нет серии и призыва.
+   Каждый вывод — с конкретным роликом и цифрами («“Курс Богиня”, 55 с: 66% пролистали сразу, смотрят 6 с»).
+
+3. **Где не уследили** — 1–3 пункта: что сделали не так за последние дни (несколько роликов в один день, длинные
+   ролики, прямая реклама курса в рилсах, повторы, язык). Только то, что видно в данных.
+
+4. **Сегодня снять: N рилс(а)** (N от 1 до 3) — одной строкой почему столько: выкладываем 1 рилс в день,
+   остальные — в запас на следующие дни (если сегодня уже был рилс — все в запас). Больше 1 — если запаса нет
+   или она пропускала дни.
+   Для каждого рилса:
+   **Рилс 1 — тема** · длина N секунд · язык (укр/рус — на каком у неё лучше смотрят) · когда выложить
+   - Почему этот: на какой её хит или залетевший ролик ниши опирается (с цифрами)
+   - Хук (первые 2 секунды, дословно): вариант А ⭐ и вариант Б
+   - Текст на экране: до 6 слов
+   - Что говорить: по секундам (0–2 с хук, дальше 3–6 фраз дословно, финал)
+   - Как снять: план, свет, куда смотреть — без реквизита, просто и быстро
+   - Подпись: 1–2 строки + призыв (переслать подруге / сохранить / подписаться ради чего)
+   Длину выбирай по её цифрам из блока «По длине ролика». Если короткие держат лучше — короткие (10–30 с).
+   Длинный (до 60–90 с) — только развитие её самой сильной темы, и хук должен быть особенно сильным.
+
+5. **Цель на сегодня** — 1–2 строки: какие цифры ждём от новых роликов по сравнению с её медианой
+   (например: «пролистали сразу ниже 40%, досмотр выше 50%»).
+
+6. Последней строкой: «Сняла — пришли мне видео до публикации, проверю хук и первые секунды 🎬»
+
+ЖЁСТКИЕ ПРАВИЛА:
+- Темы только её: деньги, отношения, женская энергия и женственность, вера/духовность в психологии, практики.
+  Механику залетевших роликов конкурентов переносишь на её тему, саму тему конкурента не копируешь.
+- Не повторяй темы и хуки роликов, которые она уже выложила за последние дни — новый угол.
+- Прямую рекламу курсов в рилсах не предлагай (если в данных она проваливается) — продажи в сторис.
+- Говори только о том, что есть в данных. Если блока внутренней статистики нет — не упоминай досмотры и
+  «пролистали сразу», опирайся на просмотры, лайки, комментарии.
+- Не рассуждай об «алгоритме» — объясняй через зрителя: что почувствовал, почему остановился или пролистал.
+- Не выдумывай личные истории и факты об Анне — пиши [вставь свою реальную историю: …].
+- Если она 2+ дня не выкладывала рилсы — мягко скажи об этом одной строкой."""
+
+
+async def _run_daily_plan(update, chat_id: int, facts_text: str, text: str, status) -> None:
+    summary = facts_text
+    own = brief.own_hits_text(DATA_DIR)
+    if own:
+        summary += "\n\n" + own
+    try:
+        result = await trends.collect(DATA_DIR)  # кэш TRENDS_CACHE_HOURS — повторно Apify не тратим
+        summary += "\n\n" + trends.trends_text(result)
+        hooks = await _hook_transcripts(result["rows"], limit=3)
+        if hooks:
+            summary += "\n\n[Что говорят в первые секунды залетевших роликов ниши — дословно]\n" + hooks
+    except Exception:
+        logger.warning("Daily plan: тренды недоступны, план без них")
+    if status:
+        try:
+            await status.edit_text("✅ Посмотрела цифры. Пишу план съёмки на сегодня…")
+        except BadRequest:
+            pass
+    content = summary + "\n\n" + DAILY_PROMPT.format(text=text.strip()[:400])
+    note = facts_text[:2000] + "\n\n[План съёмки на сегодня]"
+    if await ask_claude(update, chat_id, content, history_note=note, max_tokens=6000, edit=False):
+        _mark_mode(chat_id, "hits")
+
+
+async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _heavy_ok(update):
+        return
+    _brief_cache.clear()
+    await run_brief(update, "Что снять сегодня?", daily=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2800,20 +2930,21 @@ async def morning_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             continue
         try:
             _brief_cache.clear()
-            ask = "Доброе утро! (сводка пришла сама, по расписанию) Что у меня в Инстаграме и что снять сегодня?"
+            ask = "Доброе утро! (план пришёл сам, по расписанию)"
             st = _get_state(int(cid))
             last_v = st.get("last_video")
             now_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
             if not last_v or now_ts - last_v > 2 * 86400:
                 ask += " [Заметка бота: Анна уже 2+ дня не присылала готовое видео на проверку перед публикацией.]"
             if st.get("plan") == "daily":
-                ask += " [Анна выбрала режим «каждый день по одной теме»: дай одну тему дня с хуком.]"
-            await run_brief(_ChatProxy(context.bot, int(cid)), ask)
+                ask += " [Анна выбрала режим «каждый день по одной теме».]"
+            await run_brief(_ChatProxy(context.bot, int(cid)), ask, daily=True)
         except Exception:
             logger.exception("morning job error for %s", cid)
 
 
 async def weekly_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await iginsights.refresh_token(DATA_DIR)
     text = brief.weekly_text(DATA_DIR)
     for cid in _owner_chats():
         try:
@@ -2842,7 +2973,8 @@ async def start_morning(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     d[str(update.effective_chat.id)] = True
     _save_subs(d)
     await update.message.reply_text(
-        f"Готово! Каждое утро в {MORNING_HOUR}:00 пришлю сводку по Инстаграму, а по понедельникам — итоги недели. "
+        f"Готово! Каждое утро в {MORNING_HOUR}:00 пришлю план съёмки: что просело и почему, сколько рилсов снять, "
+        "хуки и сценарии. По понедельникам — итоги недели. "
         "Выключить: /stop_morning"
     )
 
@@ -2876,6 +3008,7 @@ def main() -> None:
     app.add_handler(CommandHandler("stop_morning", guarded(stop_morning)))
     app.add_handler(CommandHandler("week", guarded(week_command)))
     app.add_handler(CommandHandler("plan", guarded(plan_command)))
+    app.add_handler(CommandHandler("today", guarded(today_command)))
     app.add_handler(CommandHandler("owner", guarded(owner_command)))
     app.add_handler(CommandHandler("balance", guarded(balance_command)))
     app.add_handler(CallbackQueryHandler(guarded(on_plan_button), pattern=r"^plan:"))
