@@ -2181,9 +2181,14 @@ async def _run_daily_plan(update, chat_id: int, facts_text: str, text: str, stat
             await status.edit_text("✅ Посмотрела цифры. Пишу план съёмки на сегодня…")
         except BadRequest:
             pass
-    today = datetime.datetime.now(audit.LOCAL_TZ).date()
+    now = datetime.datetime.now(audit.LOCAL_TZ)
+    today = now.date()
+    days = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+    when = f"сейчас {days[now.weekday()]}, {now.strftime('%d.%m.%Y %H:%M')} (время Анны). "
+    if now.hour >= 18:
+        when += "Уже вечер — снимать и выкладывать новое лучше завтра. "
     summary += "\n\n" + launches.today_block(today)
-    content = summary + "\n\n" + DAILY_PROMPT.format(text=text.strip()[:400], plan=launches.today_plan_line(today))
+    content = summary + "\n\n" + DAILY_PROMPT.format(text=text.strip()[:400], plan=when + launches.today_plan_line(today))
     note = facts_text[:2000] + "\n\n[План съёмки на сегодня]"
     if await ask_claude(update, chat_id, content, history_note=note, max_tokens=8000, edit=False):
         _mark_mode(chat_id, "hits")
