@@ -26,7 +26,6 @@ TOPICS = [
     "мужчины и отношения (что он говорит / что она чувствует)",
     "деньги и женщина: просить, получать, платить, свои деньги в паре",
     "подруги и женская поддержка / женская конкуренция",
-    "мама, род, детство — что мы повторяем за мамой",
     "самооценка, тело, возраст, «я недостаточно…»",
     "женская энергия и сила — с юмором над эзотерическими клише",
     "вера, Бог и психология — её самая сильная тема",
@@ -38,7 +37,7 @@ def pick(state: dict, today: datetime.date, n_reels: int = 1) -> tuple[list[tupl
     """Возвращает [(формат, тема), …] на сегодня и обновлённое состояние очереди.
     Повторный запуск в тот же день даёт тот же выбор."""
     rot = dict(state.get("rot") or {})
-    if rot.get("date") == today.isoformat() and rot.get("picks"):
+    if rot.get("date") == today.isoformat() and rot.get("picks") and all(p[1] in TOPICS for p in rot["picks"]):
         return [tuple(p) for p in rot["picks"]][:max(n_reels, 1)], rot
     ti = int(rot.get("ti", today.toordinal()) or 0)
     recent = list(rot.get("recent_topics") or [])[-4:]
