@@ -1054,7 +1054,12 @@ async def fetch_url_content(url: str) -> dict:
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await process_user_text(update, update.message.text)
+    text = update.message.text or ""
+    if "localhost:8765/callback" in text and "code=" in text:  # адрес после входа в vidIQ прислали без команды
+        context.args = [text.strip().split()[-1] if text.strip().split()[-1].startswith("http") else text.strip()]
+        await vidiq_command(update, context)
+        return
+    await process_user_text(update, text)
 
 
 SCRIPT_INTENT_RE = re.compile(r"(сценари|рилс|reels|хук|ролик|подпис\w*\s+к\s+пост|что\s+снять|идеи\s+для\s+(видео|контента))", re.I)
