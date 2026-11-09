@@ -408,6 +408,37 @@ async def owner_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+async def vidiq_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Подключение внутренней статистики Instagram через вход в vidIQ (только для владельца бота)."""
+    if not _get_state(update.effective_chat.id).get("owner"):
+        await update.message.reply_text("Эта команда только для владельца бота.")
+        return
+    arg = " ".join(context.args or []).strip()
+    if arg:
+        try:
+            await vidiq.finish_oauth(arg)
+            data = await vidiq.fetch_reels(limit=3)
+            n = len(data.get("reels") or [])
+            await update.message.reply_text(f"✅ vidIQ подключён. Вижу внутреннюю статистику @{data.get('handle', 'anyalakshmi')}: "
+                                            f"{n} последних рилса с досмотрами и пролистываниями. Теперь это будет в каждом плане.")
+        except Exception as e:
+            await update.message.reply_text(f"Не получилось: {e}")
+        return
+    try:
+        url = await vidiq.start_oauth()
+    except Exception as e:
+        await update.message.reply_text(f"vidIQ сейчас не отвечает: {e}")
+        return
+    await update.message.reply_text(
+        "Подключаем статистику Instagram через vidIQ (один раз):\n\n"
+        "1. Открой ссылку ниже на компьютере, где ты вошёл в vidIQ, и нажми «Разрешить» (Allow).\n"
+        "2. Браузер откроет пустую страницу с ошибкой «localhost» — это нормально.\n"
+        "3. Скопируй ВЕСЬ адрес из строки браузера (начинается с http://localhost:8765/callback?code=…) "
+        "и пришли мне так:  /vidiq адрес\n\n" + url,
+        disable_web_page_preview=True,
+    )
+
+
 async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     d = _load_spend()
     args = context.args or []
@@ -2060,6 +2091,7 @@ DAILY_PROMPT = """Ты — личный продюсер Анны. Сейчас 
 Выше — реальные цифры, посчитанные кодом: её публикации, внутренняя статистика (если есть блок: «пролистали сразу»,
 досмотр, репосты, сохранения), её хиты и провалы, залетевшие ролики ниши и что в них говорят в первые секунды.
 Сообщение / заметки бота: «{text}».
+РЕШЕНИЕ НА СЕГОДНЯ (посчитано кодом): {plan}
 
 Блок «План прогрева на сегодня» посчитан кодом по календарю её запусков: фаза, сколько рилсов и сторис —
 это решение, следуй ему. Если в «Реальных историях и фактах Анны» есть более свежая дата или новый продукт —
@@ -2119,7 +2151,11 @@ DAILY_PROMPT = """Ты — личный продюсер Анны. Сейчас 
   «пролистали сразу», опирайся на просмотры, лайки, комментарии.
 - Не рассуждай об «алгоритме» — объясняй через зрителя: что почувствовал, почему остановился или пролистал.
 - Не выдумывай личные истории и факты об Анне — пиши [вставь свою реальную историю: …].
-- Если она 2+ дня не выкладывала рилсы — мягко скажи об этом одной строкой."""
+- Если она 2+ дня не выкладывала рилсы — мягко скажи об этом одной строкой.
+- Монолог «сижу и говорю в камеру» — только формат 3–4 и до 30 секунд. Хотя бы один рилс — формат 1 или 2.
+
+ПРОВЕРЬ ПЕРЕД ОТПРАВКОЙ: есть все 8 разделов, включая «Где мы сейчас» и «Прогрев в сторис»; сторис ровно
+столько, сколько в решении на сегодня; у каждого рилса указан формат (1–4); ни одного выдуманного факта."""
 
 
 async def _run_daily_plan(update, chat_id: int, facts_text: str, text: str, status) -> None:
@@ -2140,8 +2176,9 @@ async def _run_daily_plan(update, chat_id: int, facts_text: str, text: str, stat
             await status.edit_text("✅ Посмотрела цифры. Пишу план съёмки на сегодня…")
         except BadRequest:
             pass
-    summary += "\n\n" + launches.today_block(datetime.datetime.now(audit.LOCAL_TZ).date())
-    content = summary + "\n\n" + DAILY_PROMPT.format(text=text.strip()[:400])
+    today = datetime.datetime.now(audit.LOCAL_TZ).date()
+    summary += "\n\n" + launches.today_block(today)
+    content = summary + "\n\n" + DAILY_PROMPT.format(text=text.strip()[:400], plan=launches.today_plan_line(today))
     note = facts_text[:2000] + "\n\n[План съёмки на сегодня]"
     if await ask_claude(update, chat_id, content, history_note=note, max_tokens=8000, edit=False):
         _mark_mode(chat_id, "hits")
@@ -3033,6 +3070,7 @@ def main() -> None:
     app.add_handler(CommandHandler("today", guarded(today_command)))
     app.add_handler(CommandHandler("owner", guarded(owner_command)))
     app.add_handler(CommandHandler("balance", guarded(balance_command)))
+    app.add_handler(CommandHandler("vidiq", guarded(vidiq_command)))
     app.add_handler(CallbackQueryHandler(guarded(on_plan_button), pattern=r"^plan:"))
     if MORNING_ENABLED and app.job_queue is not None:
         t = datetime.time(hour=MORNING_HOUR, minute=0, tzinfo=audit.LOCAL_TZ)
