@@ -2106,6 +2106,12 @@ DAILY_PROMPT = """Ты — личный продюсер Анны. Сейчас 
 
 1. Приветствие одной строкой.
 
+1а. **Как сработали мои прошлые советы** — если есть блок «ТВОИ ПРОШЛЫЕ ПЛАНЫ»: 2–4 строки как у продюсера.
+   Найди в данных ролики, которые она выложила после плана (по теме/подписи/дате). Для каждого: сняла или нет;
+   если сняла — цифры против цели (пролистали сразу, досмотр, репосты) и вывод: хук сработал / не сработал и почему.
+   Если не сняла — одной строкой мягко: «Вчерашний ролик про … ещё не вышел — снимаем сегодня или меняем?».
+   Свои прошлые советы не повторяй слово в слово; что сработало — развивай, что провалилось — не предлагай снова.
+
 2. **Что происходит** — 3–5 строк по цифрам. Главная проблема прямо сейчас и где теряем людей:
    - пролистывают в первые секунды (выше ~45%) → хук не цепляет;
    - смотрят малую долю ролика → затянуто или слишком длинно;
@@ -2198,10 +2204,30 @@ async def _run_daily_plan(update, chat_id: int, facts_text: str, text: str, stat
     if now.hour >= 18:
         when += "Уже вечер — снимать и выкладывать новое лучше завтра. "
     summary += "\n\n" + launches.today_block(today)
+    past = _get_state(chat_id).get("plans") or []
+    if past:
+        summary += ("\n\n[ТВОИ ПРОШЛЫЕ ПЛАНЫ — что ты советовала Анне (сверь с данными выше: вышли ли эти ролики и как сработали)]\n"
+                    + "\n---\n".join(f"{p['date']}:\n{p['text']}" for p in past[-3:]))
     content = summary + "\n\n" + DAILY_PROMPT.format(text=text.strip()[:400], plan=when + launches.today_plan_line(today))
     note = facts_text[:2000] + "\n\n[План съёмки на сегодня]"
-    if await ask_claude(update, chat_id, content, history_note=note, max_tokens=8000, edit=False):
+    reply = await ask_claude(update, chat_id, content, history_note=note, max_tokens=8000, edit=False)
+    if reply:
         _mark_mode(chat_id, "hits")
+        plans = (_get_state(chat_id).get("plans") or [])[-4:]
+        plans.append({"date": today.strftime("%d.%m"), "text": _plan_digest(reply)})
+        _set_state(chat_id, "plans", plans)
+
+
+def _plan_digest(reply: str) -> str:
+    """Короткая выжимка плана для памяти: темы рилсов, хуки и цель (без длинных подписей и сторис)."""
+    keep = []
+    for line in reply.splitlines():
+        l = line.strip()
+        if not l:
+            continue
+        if re.search(r"(Рилс \d|Хук|Вариант А|⭐|Цель на|пролистали сразу ниже|досмотр выше|Формат)", l):
+            keep.append(l[:220])
+    return "\n".join(keep)[:1200] or reply[:800]
 
 
 async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
