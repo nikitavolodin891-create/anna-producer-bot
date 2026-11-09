@@ -13,6 +13,10 @@ import os
 import statistics
 import time
 import datetime
+import base64
+import hashlib
+import secrets
+import urllib.parse
 
 import httpx
 
@@ -23,9 +27,116 @@ IG_ACCOUNT = os.environ.get("VIDIQ_IG_ACCOUNT", "28343978111904133")  # platform
 CACHE_SECONDS = 2 * 3600
 _cache: dict = {}
 
+# Статистика владельца Instagram в vidIQ доступна только через вход в vidIQ (OAuth), API-ключ её не открывает.
+# Владелец бота один раз входит по ссылке из /vidiq — бот хранит ключ входа на своём диске и сам его продлевает.
+DATA_DIR = os.environ.get("DATA_DIR", "/data")
+OAUTH_FILE = os.path.join(DATA_DIR, "vidiq_oauth.json")
+AUTH_BASE = "https://mcp.vidiq.com/mcp"
+REDIRECT_URI = "http://localhost:8765/callback"
+RESOURCE = "https://mcp.vidiq.com/mcp"
+
+
+def _load_oauth() -> dict:
+    try:
+        with open(OAUTH_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_oauth(d: dict) -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(OAUTH_FILE, "w", encoding="utf-8") as f:
+        json.dump(d, f)
+
+
+def connected() -> bool:
+    return bool(_load_oauth().get("refresh_token") or _load_oauth().get("access_token"))
+
 
 def enabled() -> bool:
-    return bool(os.environ.get("VIDIQ_API_KEY", "").strip())
+    return connected() or bool(os.environ.get("VIDIQ_API_KEY", "").strip())
+
+
+async def start_oauth() -> str:
+    """Регистрирует бота в vidIQ и возвращает ссылку для входа."""
+    async with httpx.AsyncClient(timeout=30) as http:
+        r = await http.post(f"{AUTH_BASE}/register", json={
+            "client_name": "Anna producer bot",
+            "redirect_uris": [REDIRECT_URI],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+        })
+        if r.status_code >= 400:
+            raise VidiqError(f"vidIQ не дал зарегистрироваться (HTTP {r.status_code}): {r.text[:200]}")
+        client_id = r.json()["client_id"]
+    verifier = secrets.token_urlsafe(48)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+    state = secrets.token_urlsafe(16)
+    d = _load_oauth()
+    d["pending"] = {"client_id": client_id, "verifier": verifier, "state": state, "ts": time.time()}
+    _save_oauth(d)
+    q = urllib.parse.urlencode({
+        "response_type": "code", "client_id": client_id, "redirect_uri": REDIRECT_URI,
+        "code_challenge": challenge, "code_challenge_method": "S256", "state": state,
+        "scope": "api", "resource": RESOURCE,
+    })
+    return f"{AUTH_BASE}/authorize?{q}"
+
+
+async def finish_oauth(text: str) -> None:
+    """Принимает адрес, на который vidIQ перекинул после входа (localhost…?code=…), и получает ключ входа."""
+    d = _load_oauth()
+    pend = d.get("pending")
+    if not pend:
+        raise VidiqError("сначала получи ссылку: /vidiq")
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(text.strip()).query)
+    code = (qs.get("code") or [""])[0]
+    if not code:
+        raise VidiqError("в адресе нет code=… — скопируй адрес целиком из строки браузера")
+    if qs.get("state") and qs["state"][0] != pend["state"]:
+        raise VidiqError("ссылка устарела — получи новую: /vidiq")
+    async with httpx.AsyncClient(timeout=30) as http:
+        r = await http.post(f"{AUTH_BASE}/token", data={
+            "grant_type": "authorization_code", "code": code, "redirect_uri": REDIRECT_URI,
+            "client_id": pend["client_id"], "code_verifier": pend["verifier"], "resource": RESOURCE,
+        })
+    if r.status_code >= 400:
+        raise VidiqError(f"vidIQ не принял код (HTTP {r.status_code}) — получи новую ссылку: /vidiq")
+    tok = r.json()
+    _save_oauth({"client_id": pend["client_id"], "access_token": tok.get("access_token"),
+                 "refresh_token": tok.get("refresh_token"),
+                 "expires_at": time.time() + float(tok.get("expires_in") or 3600) - 120})
+    _cache.clear()
+
+
+async def _refresh(d: dict) -> dict:
+    async with httpx.AsyncClient(timeout=30) as http:
+        r = await http.post(f"{AUTH_BASE}/token", data={
+            "grant_type": "refresh_token", "refresh_token": d["refresh_token"],
+            "client_id": d["client_id"], "resource": RESOURCE,
+        })
+    if r.status_code >= 400:
+        raise VidiqError(f"vidIQ: вход устарел (HTTP {r.status_code}) — владелец бота: /vidiq")
+    tok = r.json()
+    d.update(access_token=tok.get("access_token"),
+             refresh_token=tok.get("refresh_token") or d["refresh_token"],
+             expires_at=time.time() + float(tok.get("expires_in") or 3600) - 120)
+    _save_oauth(d)
+    return d
+
+
+async def _bearer(force_refresh: bool = False) -> str:
+    d = _load_oauth()
+    if d.get("access_token"):
+        if (force_refresh or d.get("expires_at", 0) < time.time()) and d.get("refresh_token"):
+            d = await _refresh(d)
+        return d["access_token"]
+    key = os.environ.get("VIDIQ_API_KEY", "").strip()
+    if not key:
+        raise VidiqError("vidIQ не подключён — владелец бота: /vidiq")
+    return key
 
 
 class VidiqError(RuntimeError):
@@ -52,10 +163,16 @@ def _parse(r: httpx.Response) -> dict:
         return {}
 
 
-async def _call_tool(name: str, arguments: dict) -> dict:
-    key = os.environ.get("VIDIQ_API_KEY", "").strip()
-    if not key:
-        raise VidiqError("нет ключа VIDIQ_API_KEY")
+async def _call_tool(name: str, arguments: dict, _retry: bool = True) -> dict:
+    try:
+        return await _call_tool_once(name, arguments, await _bearer())
+    except VidiqError as e:
+        if _retry and connected() and "HTTP 401" in str(e):
+            return await _call_tool_once(name, arguments, await _bearer(force_refresh=True))
+        raise
+
+
+async def _call_tool_once(name: str, arguments: dict, key: str) -> dict:
     headers = {
         "Authorization": f"Bearer {key}",
         "Accept": "application/json, text/event-stream",
@@ -68,7 +185,7 @@ async def _call_tool(name: str, arguments: dict) -> dict:
                        "clientInfo": {"name": "anna-producer-bot", "version": "1.0"}},
         }
         r = await http.post(MCP_URL, headers=headers, json=init_req)
-        if r.status_code in (401, 403):  # другой способ передать ключ
+        if r.status_code in (401, 403) and not connected():  # другой способ передать API-ключ
             alt = {k: v for k, v in headers.items() if k != "Authorization"}
             alt["X-API-Key"] = key
             r2 = await http.post(MCP_URL, headers=alt, json=init_req)
