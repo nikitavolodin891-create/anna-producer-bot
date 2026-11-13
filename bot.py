@@ -365,6 +365,20 @@ def spend_week() -> float:
     return sum(v for k, v in d.items() if k > since)
 
 
+_apify_alerted: dict = {}
+
+
+def _apify_alert(e) -> None:
+    """Один раз в сутки сказать владельцу, что Apify отвалился (бот при этом продолжает работать на vidIQ)."""
+    day = datetime.date.today().isoformat()
+    if _apify_alerted.get("day") == day:
+        return
+    _apify_alerted["day"] = day
+    _pending_alerts.append(f"[!] Apify не работает ({str(e)[:120]}). Бот работает по статистике vidIQ, но без трендов "
+                           "конкурентов и сравнения подписчиков. Обнови ключ: console.apify.com → Settings → "
+                           "API & Integrations → скопируй токен → Railway → Variables → APIFY_TOKEN.")
+
+
 def _owner_chats() -> list[int]:
     return [int(cid) for cid, st in _all_state().items() if st.get("owner")]
 
@@ -1974,19 +1988,20 @@ async def run_hits(update: Update, topic: str = "") -> None:
     )
     try:
         result = await trends.collect(DATA_DIR)
-    except trends.TrendsError as e:
-        await status.edit_text(f"Не получилось найти залетевшие ролики: {e}")
-        return
-    except Exception:
-        logger.exception("Hits error")
-        await status.edit_text("Не получилось найти залетевшие ролики. Попробуй ещё раз через пару минут.")
-        return
+        trends_ok = True
+    except Exception as e:  # тренды недоступны — пишем хиты по её собственным данным и механикам
+        logger.warning("Hits trends error: %s", e)
+        _apify_alert(e)
+        result, trends_ok = {"rows": []}, False
     try:
-        await status.edit_text(f"✅ Нашла {len(result['rows'])} залетевших роликов. Разбираю механику и пишу сценарии…")
+        await status.edit_text(
+            f"✅ Нашла {len(result['rows'])} залетевших роликов. Разбираю механику и пишу сценарии…" if trends_ok
+            else "✅ Смотрю твою статистику и твои хиты. Придумываю сценарии… 2–3 минуты ⏳")
     except BadRequest:
         pass
-    summary = trends.trends_text(result)
-    hooks = await _hook_transcripts(result["rows"])
+    summary = trends.trends_text(result) if trends_ok else (
+        "[Тренды ниши сегодня недоступны — опирайся на её собственные хиты, внутреннюю статистику и механики ниже]")
+    hooks = await _hook_transcripts(result["rows"]) if trends_ok else ""
     if hooks:
         summary += "\n\n[Что говорят в первые секунды залетевших роликов — дословная расшифровка]\n" + hooks
     own = brief.own_hits_text(DATA_DIR)
@@ -1996,7 +2011,7 @@ async def run_hits(update: Update, topic: str = "") -> None:
     if ig:
         summary += "\n\n" + ig
     content: list[dict] = [{"type": "text", "text": summary}]
-    for label, data_bytes, mime in await trends.covers(result, limit=3):
+    for label, data_bytes, mime in (await trends.covers(result, limit=3) if trends_ok else []):
         content.append({"type": "text", "text": f"Обложка {label}"})
         content.append(social.image_block(data_bytes, mime))
     topic_line = f"\n\nЗапрос Анны: {topic.strip()[:300]}" if topic.strip() else ""
@@ -2081,22 +2096,27 @@ async def run_brief(update, text: str, daily: bool = False) -> None:
         try:
             data = await audit.fetch_account(handle, limit=brief.BRIEF_POSTS)
             stats = audit.build_stats(data)
-        except audit.AuditError as e:
-            await status.edit_text(f"Не получилось заглянуть в Instagram: {e}")
-            return
-        except Exception:
-            logger.exception("Brief fetch error")
-            await status.edit_text("Не получилось выгрузить Instagram. Попробуй ещё раз через пару минут.")
-            return
-        prev = brief.load_snapshot(DATA_DIR)
-        try:
-            brief.save_snapshot(DATA_DIR, brief.make_snapshot(stats))
-            brief.add_history(DATA_DIR, stats)
-        except OSError:
-            logger.exception("Brief snapshot save error")
-        _brief_cache[handle] = {"t": now, "stats": stats, "prev": prev}
+        except Exception as e:
+            logger.warning("Brief fetch error: %s", e)
+            if not vidiq.enabled():
+                await status.edit_text(f"Не получилось заглянуть в Instagram: {e}")
+                return
+            _apify_alert(e)
+            stats, prev = None, None  # работаем по внутренней статистике vidIQ
+        if stats is not None:
+            prev = brief.load_snapshot(DATA_DIR)
+            try:
+                brief.save_snapshot(DATA_DIR, brief.make_snapshot(stats))
+                brief.add_history(DATA_DIR, stats)
+            except OSError:
+                logger.exception("Brief snapshot save error")
+            _brief_cache[handle] = {"t": now, "stats": stats, "prev": prev}
     now_local = datetime.datetime.now(audit.LOCAL_TZ)
-    facts_text = brief.brief_text(stats, prev, now_local)
+    if stats is not None:
+        facts_text = brief.brief_text(stats, prev, now_local)
+    else:
+        facts_text = ("[Публичная выгрузка Instagram сейчас недоступна — опирайся на внутреннюю статистику ниже "
+                      "(она точнее). Подписчиков за сутки и комментарии не сравнивай — этих данных сегодня нет.]")
     ig = await _owner_stats_text(stats)
     if ig:
         facts_text += "\n\n" + ig
