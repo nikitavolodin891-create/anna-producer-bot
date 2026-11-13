@@ -30,10 +30,10 @@ DEFAULT_HASHTAGS = [
     ).split(",")
     if h.strip()
 ]
-POSTS_PER_HASHTAG = int(os.environ.get("TRENDS_PER_HASHTAG", "25"))
+POSTS_PER_HASHTAG = int(os.environ.get("TRENDS_PER_HASHTAG", "15"))
 POSTS_PER_ACCOUNT = int(os.environ.get("TRENDS_PER_ACCOUNT", "15"))
 FRESH_DAYS = int(os.environ.get("TRENDS_FRESH_DAYS", "14"))
-CACHE_HOURS = float(os.environ.get("TRENDS_CACHE_HOURS", "6"))
+CACHE_HOURS = float(os.environ.get("TRENDS_CACHE_HOURS", "168"))  # тренды ниши — раз в неделю, чтобы влезать в $5 Apify
 OUTLIER_X = 2.0
 MIN_TAG_PLAYS = int(os.environ.get("TRENDS_MIN_PLAYS", "5000"))  # слабее — не тренд
 MAX_ACCOUNTS = 10
